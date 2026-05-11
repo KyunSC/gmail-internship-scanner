@@ -5,6 +5,7 @@ No email data leaves your machine (except to/from Google's servers, where it alr
 """
 
 import base64
+import html
 import json
 import os
 import re
@@ -117,6 +118,7 @@ def _extract_body(payload: dict) -> str:
     else:
         return ""
 
+    text = html.unescape(text)
     text = re.sub("[​-‏‪-‮⁠﻿]", "", text)
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"\s+", " ", text)
@@ -125,7 +127,48 @@ def _extract_body(payload: dict) -> str:
     return text.strip()
 
 
-BODY_MAX_CHARS = 2500  # truncate to keep prompts manageable and skip footers
+BODY_MAX_CHARS = 5000  # truncate to keep prompts manageable and skip footers
+
+
+# Glassdoor puts the headline job in the body ("Job alert: <Title> Your job listings ..."),
+# not in the subject — the subject typically lists unrelated "you might also like" jobs.
+GLASSDOOR_HEADLINE_RE = re.compile(r"Job alert:\s*(.+?)\s+Your job listings", re.IGNORECASE)
+
+
+def _normalize_aggregator_email(sender: str, subject: str, body: str) -> tuple[str, str]:
+    """Rewrite (subject, body) for aggregators where body recommendation sections
+    confuse the filters (e.g. Fall 2026 false positives) or where the real headline
+    isn't in the subject."""
+    sender_lower = (sender or "").lower()
+
+    if "glassdoor.com" in sender_lower:
+        # Glassdoor puts the headline in the body ("Job alert: X"); the subject
+        # lists unrelated "you might also like" jobs.
+        m = GLASSDOOR_HEADLINE_RE.search(body)
+        if not m:
+            return subject, body
+        headline = m.group(1).strip()
+        start = body.find("Job alert:")
+        # The Glassdoor headline section ends at the first "★" (the next job's rating).
+        end = body.find("★", start) if start != -1 else -1
+        if start != -1 and end != -1:
+            trimmed_body = body[start:end].strip()
+        elif start != -1:
+            trimmed_body = body[start:start + 200].strip()
+        else:
+            trimmed_body = body
+        return headline, trimmed_body
+
+    if "jobright.ai" in sender_lower:
+        # JobRight already has the headline in the subject, but the body appends a
+        # "More Great Matches" recommendations block that often contains Fall 2026
+        # listings — trim to the headline section (everything up to the first APPLY NOW).
+        apply_idx = body.find("APPLY NOW")
+        if apply_idx != -1:
+            return subject, body[:apply_idx].strip()
+        return subject, body
+
+    return subject, body
 
 
 def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
@@ -151,14 +194,17 @@ def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
 
             payload = msg.get("payload", {})
             headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
+            subject = headers.get("Subject", "(no subject)")
+            sender = headers.get("From", "unknown")
             body = _extract_body(payload)
+            subject, body = _normalize_aggregator_email(sender, subject, body)
             if len(body) > BODY_MAX_CHARS:
                 body = body[:BODY_MAX_CHARS] + " …[truncated]"
 
             emails.append({
                 "id": msg_meta["id"],
-                "subject": headers.get("Subject", "(no subject)"),
-                "from": headers.get("From", "unknown"),
+                "subject": subject,
+                "from": sender,
                 "date": headers.get("Date", ""),
                 "body": body,
             })
