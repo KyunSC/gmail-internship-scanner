@@ -293,6 +293,7 @@ def export_json(results: list[dict], path: str):
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
+    global OLLAMA_MODEL
     parser = argparse.ArgumentParser(
         description="Scan Gmail for internship opportunities using a local LLM."
     )
@@ -323,7 +324,6 @@ def main():
     )
     args = parser.parse_args()
 
-    global OLLAMA_MODEL
     if args.model:
         OLLAMA_MODEL = args.model
 

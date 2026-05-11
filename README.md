@@ -28,10 +28,10 @@ curl -fsSL https://ollama.com/install.sh | sh
 # Windows: download from https://ollama.com/download
 ```
 
-Pull a model (llama3.1:8b is a good balance of speed and quality):
+Pull a model (qwen2.5:7b is a good balance of speed and quality):
 
 ```bash
-ollama pull llama3.1:8b
+ollama pull qwen2.5:7b
 ```
 
 Start the server (if not already running):
