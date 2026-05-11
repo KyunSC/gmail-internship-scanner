@@ -91,7 +91,7 @@ def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
     return emails
 
 
-def run_gmail_search(service, keyword: str = "", days: int = 30) -> list[dict]:
+def run_gmail_search(service, keyword: str = "", days: int = 30, unread_only: bool = True) -> list[dict]:
     """Run multiple targeted searches and deduplicate results."""
     if keyword.strip():
         queries = [
@@ -104,6 +104,9 @@ def run_gmail_search(service, keyword: str = "", days: int = 30) -> list[dict]:
             f"subject:(application OR applied OR interview OR offer) after:{cutoff}",
             f"from:(recruiter OR talent OR hiring OR careers OR hr) after:{cutoff}",
         ]
+
+    if unread_only:
+        queries = [f"is:unread {q}" for q in queries]
 
     all_emails = {}
     for q in queries:
@@ -138,15 +141,11 @@ def check_ollama():
         sys.exit(1)
 
 
-def analyze_with_ollama(emails: list[dict]) -> list[dict]:
-    """Send email metadata to Ollama for classification and summarization."""
-    if not emails:
-        return []
-
-    # Build a compact representation of emails
+def _analyze_batch(emails: list[dict], offset: int) -> list[dict]:
+    """Analyze a single batch of emails. offset is the 1-based index of emails[0]."""
     email_text = ""
     for i, e in enumerate(emails):
-        email_text += f"\n--- Email {i+1} ---\n"
+        email_text += f"\n--- Email {offset + i} ---\n"
         email_text += f"Subject: {e['subject']}\n"
         email_text += f"From: {e['from']}\n"
         email_text += f"Date: {e['date']}\n"
@@ -154,63 +153,150 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
 
     prompt = f"""You are analyzing a student's inbox for internship and job-related emails.
 
-For each email below, determine if it is related to:
-- Internship/co-op/stage job postings
-- Recruiter outreach or hiring manager contact
-- Application confirmations or status updates
-- Interview invitations or follow-ups
+For each email, determine if it is one of:
+- Internship / co-op / stage / stagiaire job postings (STUDENT positions only)
+- Recruiter outreach or hiring manager contact about an internship
+- Application confirmations or status updates for an internship application
+- Interview invitations or follow-ups for an internship
 
-IGNORE newsletters, promotional emails, spam, and unrelated content.
+STRICT RULES — these MUST be followed:
+1. ONLY include actual internship/co-op/stage/stagiaire positions. The subject or snippet
+   MUST explicitly mention one of: "intern", "internship", "stage", "stagiaire", "co-op",
+   "coop", or "student". If none of these words appear, EXCLUDE the email.
+2. EXCLUDE all full-time roles, including "junior", "senior", "mid-level", "lead",
+   "associate", "engineer", "developer", "analyst", or "specialist" positions when they
+   are NOT explicitly labeled as an internship.
+3. For job-aggregator emails (LinkedIn, Glassdoor, Jobright, Indeed Job Alerts):
+   - The aggregator email is RELEVANT ONLY if the lead/headline job title in the subject
+     is explicitly an internship/co-op/stage.
+   - Digest emails like "Java Developer at X and 7 more jobs" are EXCLUDED unless that
+     lead job itself is explicitly an internship.
+   - "Junior Data Engineer", "Senior Full Stack", "Application Engineer" without
+     "intern/stage/co-op" qualifier → EXCLUDE.
+4. Application confirmations, recruiter messages, and status updates from companies
+   directly (e.g. PCL, WSP, Staples, Indeed Apply confirmations) about YOUR internship
+   applications ARE relevant and should be included.
+5. EXCLUDE any internship explicitly for "Fall 2026" / "Automne 2026" / "F2026"
+   (the student is not looking for fall positions). If the subject or snippet
+   mentions Fall 2026 as the term, EXCLUDE the email even if it's an internship.
+6. IGNORE newsletters, promotional emails, Quora digests, and unrelated content.
 
-For each RELEVANT email, output a JSON object. Return ONLY a valid JSON array, nothing else.
-Each object must have:
-- "email_index": the email number (1-based)
+Return a JSON object with a single key "results" whose value is an array.
+For each RELEVANT email, include an object in the array with these fields:
+- "email_index": the email number shown above (integer)
 - "subject": the email subject
 - "from": sender
 - "date": date
 - "company": company name if identifiable, or null
 - "category": one of "internship", "recruiter", "confirmation", "reply", "status"
 - "summary": 1-2 sentence summary
-- "action_items": array of action items, or empty array
+- "action_items": array of action items (strings), or empty array
 - "priority": "high", "medium", or "low"
 
-If NO emails are relevant, return: []
+If NO emails in this batch are relevant, return: {{"results": []}}
 
 Emails:
-{email_text}
+{email_text}"""
 
-Respond with ONLY the JSON array:"""
+    r = requests.post(
+        f"{OLLAMA_URL}/api/generate",
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.1, "num_predict": 4096},
+        },
+        timeout=180,
+    )
+    r.raise_for_status()
+    raw = r.json().get("response", "").strip()
+    parsed = json.loads(raw)
+    if isinstance(parsed, dict):
+        return parsed.get("results", []) or []
+    if isinstance(parsed, list):
+        return parsed
+    return []
 
-    try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 4096},
-            },
-            timeout=120,
-        )
-        r.raise_for_status()
-        raw = r.json().get("response", "").strip()
 
-        # Clean up response
-        raw = raw.replace("```json", "").replace("```", "").strip()
+AGGREGATOR_SENDERS = (
+    "linkedin.com",
+    "glassdoor.com",
+    "jobright.ai",
+    "match.indeed.com",  # Indeed job alerts (not Indeed Apply confirmations)
+)
 
-        # Try to find JSON array
-        start = raw.find("[")
-        end = raw.rfind("]")
-        if start != -1 and end != -1:
-            return json.loads(raw[start : end + 1])
+INTERNSHIP_KEYWORDS = (
+    "intern", "internship", "stage", "stagiaire", "co-op", "coop", "student",
+)
+
+EXCLUDE_TERM_PATTERNS = (
+    "fall 2026", "fall2026", "f2026", "f-2026",
+    "automne 2026", "automne2026", "a2026", "a-2026",
+)
+
+
+def _is_aggregator(sender: str) -> bool:
+    s = (sender or "").lower()
+    return any(domain in s for domain in AGGREGATOR_SENDERS)
+
+
+def _subject_mentions_internship(subject: str) -> bool:
+    s = (subject or "").lower()
+    return any(kw in s for kw in INTERNSHIP_KEYWORDS)
+
+
+def _mentions_excluded_term(*texts: str) -> bool:
+    blob = " ".join(t.lower() for t in texts if t)
+    return any(pat in blob for pat in EXCLUDE_TERM_PATTERNS)
+
+
+def analyze_with_ollama(emails: list[dict]) -> list[dict]:
+    """Send email metadata to Ollama for classification and summarization in batches."""
+    if not emails:
         return []
 
-    except json.JSONDecodeError as e:
-        print(f"  [!] Could not parse model output: {e}")
-        return []
-    except requests.RequestException as e:
-        print(f"  [!] Ollama request failed: {e}")
-        return []
+    BATCH_SIZE = 10
+    results: list[dict] = []
+    total_batches = (len(emails) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for b in range(total_batches):
+        start = b * BATCH_SIZE
+        end = min(start + BATCH_SIZE, len(emails))
+        batch = emails[start:end]
+        print(f"  Batch {b+1}/{total_batches} (emails {start+1}-{end})...")
+        try:
+            batch_results = _analyze_batch(batch, offset=start + 1)
+            results.extend(batch_results)
+        except json.JSONDecodeError as e:
+            print(f"  [!] Batch {b+1} parse failed, skipping: {e}")
+        except requests.RequestException as e:
+            print(f"  [!] Batch {b+1} request failed, skipping: {e}")
+
+    # Safety filters
+    filtered = []
+    dropped_aggregator = 0
+    dropped_term = 0
+    for r in results:
+        if _is_aggregator(r.get("from", "")) and not _subject_mentions_internship(r.get("subject", "")):
+            dropped_aggregator += 1
+            continue
+        # Pull the original snippet so we can also filter on body text
+        idx = r.get("email_index")
+        snippet = ""
+        if isinstance(idx, int) and 1 <= idx <= len(emails):
+            snippet = emails[idx - 1].get("snippet", "")
+        if _mentions_excluded_term(r.get("subject", ""), r.get("summary", ""), snippet):
+            dropped_term += 1
+            continue
+        filtered.append(r)
+
+    if dropped_aggregator:
+        print(f"  Filtered out {dropped_aggregator} aggregator email(s) without internship keywords")
+    if dropped_term:
+        print(f"  Filtered out {dropped_term} email(s) mentioning excluded term (e.g. Fall 2026)")
+
+    return filtered
 
 
 # ── Display ─────────────────────────────────────────────────────────────────
@@ -322,6 +408,11 @@ def main():
         type=int, default=30,
         help="Max emails to fetch per query (default: 30)"
     )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Scan all emails (default: unread only)"
+    )
     args = parser.parse_args()
 
     if args.model:
@@ -340,12 +431,13 @@ def main():
     service = get_gmail_service()
 
     # Search
+    scope = "all emails" if args.all else "unread only"
     if args.keyword:
-        print(f"  Keyword search: '{args.keyword}'")
+        print(f"  Keyword search: '{args.keyword}' ({scope})")
     else:
-        print(f"  Scanning last {args.days} days")
+        print(f"  Scanning last {args.days} days ({scope})")
 
-    emails = run_gmail_search(service, keyword=args.keyword, days=args.days)
+    emails = run_gmail_search(service, keyword=args.keyword, days=args.days, unread_only=not args.all)
     print(f"  Found {len(emails)} emails to analyze")
 
     if not emails:
