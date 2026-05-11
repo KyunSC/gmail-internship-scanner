@@ -117,13 +117,15 @@ def _extract_body(payload: dict) -> str:
     else:
         return ""
 
+    text = re.sub("[​-‏‪-‮⁠﻿]", "", text)
+    text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"\s+", " ", text)
     # Collapse runs of any single non-alphanumeric char (decorative separators like ===, ---, ***)
     text = re.sub(r"([^\w\s])\1{3,}", r"\1\1\1", text)
     return text.strip()
 
 
-BODY_MAX_CHARS = 800  # truncate to keep prompts manageable and skip footers
+BODY_MAX_CHARS = 2500  # truncate to keep prompts manageable and skip footers
 
 
 def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
@@ -149,7 +151,6 @@ def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
 
             payload = msg.get("payload", {})
             headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
-            snippet = msg.get("snippet", "")
             body = _extract_body(payload)
             if len(body) > BODY_MAX_CHARS:
                 body = body[:BODY_MAX_CHARS] + " …[truncated]"
@@ -159,7 +160,6 @@ def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
                 "subject": headers.get("Subject", "(no subject)"),
                 "from": headers.get("From", "unknown"),
                 "date": headers.get("Date", ""),
-                "snippet": snippet,
                 "body": body,
             })
         except Exception:
@@ -226,8 +226,7 @@ def _analyze_batch(emails: list[dict], offset: int) -> list[dict]:
         email_text += f"Subject: {e['subject']}\n"
         email_text += f"From: {e['from']}\n"
         email_text += f"Date: {e['date']}\n"
-        body = e.get("body") or e.get("snippet", "")
-        email_text += f"Body: {body}\n"
+        email_text += f"Body: {e.get('body', '')}\n"
 
     prompt = f"""You are analyzing a student's inbox for internship and job-related emails.
 
@@ -465,9 +464,8 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
             dropped_aggregator += 1
             continue
 
-        snippet = original.get("snippet", "")
         body = original.get("body", "")
-        if _mentions_excluded_term(subject, r.get("summary", ""), snippet, body):
+        if _mentions_excluded_term(subject, r.get("summary", ""), body):
             dropped_term += 1
             continue
 
