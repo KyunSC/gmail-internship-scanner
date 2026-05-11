@@ -4,11 +4,14 @@ Scans your Gmail for internship/co-op opportunities and analyzes them locally.
 No email data leaves your machine (except to/from Google's servers, where it already lives).
 """
 
+import base64
 import json
 import os
+import re
 import sys
 import argparse
 from datetime import datetime, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 
 import requests
@@ -25,6 +28,7 @@ CREDS_PATH = Path(__file__).parent / "credentials.json"
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
+DEBUG = False
 
 # ── Gmail Auth ──────────────────────────────────────────────────────────────
 
@@ -53,8 +57,77 @@ def get_gmail_service():
 
 # ── Gmail Search ────────────────────────────────────────────────────────────
 
+class _TextExtractor(HTMLParser):
+    """Strip HTML tags and collect text content, skipping script/style blocks."""
+
+    def __init__(self):
+        super().__init__()
+        self.parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data):
+        if self._skip_depth == 0:
+            self.parts.append(data)
+
+
+def _html_to_text(html: str) -> str:
+    p = _TextExtractor()
+    try:
+        p.feed(html)
+    except Exception:
+        return html
+    return " ".join(p.parts)
+
+
+def _extract_body(payload: dict) -> str:
+    """Walk MIME parts and return the cleanest text body we can find."""
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+
+    def walk(part: dict):
+        mime = part.get("mimeType", "")
+        body = part.get("body", {})
+        data = body.get("data")
+        if data:
+            try:
+                decoded = base64.urlsafe_b64decode(data + "===").decode("utf-8", errors="replace")
+            except Exception:
+                decoded = ""
+            if mime == "text/plain":
+                plain_parts.append(decoded)
+            elif mime == "text/html":
+                html_parts.append(decoded)
+        for sub in part.get("parts", []) or []:
+            walk(sub)
+
+    walk(payload)
+
+    if plain_parts:
+        text = "\n".join(plain_parts)
+    elif html_parts:
+        text = _html_to_text("\n".join(html_parts))
+    else:
+        return ""
+
+    text = re.sub(r"\s+", " ", text)
+    # Collapse runs of any single non-alphanumeric char (decorative separators like ===, ---, ***)
+    text = re.sub(r"([^\w\s])\1{3,}", r"\1\1\1", text)
+    return text.strip()
+
+
+BODY_MAX_CHARS = 800  # truncate to keep prompts manageable and skip footers
+
+
 def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
-    """Search Gmail and return a list of simplified email dicts."""
+    """Search Gmail and return a list of simplified email dicts (with full body)."""
     try:
         result = service.users().messages().list(
             userId="me", q=query, maxResults=max_results
@@ -71,12 +144,15 @@ def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
     for msg_meta in messages:
         try:
             msg = service.users().messages().get(
-                userId="me", id=msg_meta["id"], format="metadata",
-                metadataHeaders=["Subject", "From", "Date"]
+                userId="me", id=msg_meta["id"], format="full"
             ).execute()
 
-            headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+            payload = msg.get("payload", {})
+            headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
             snippet = msg.get("snippet", "")
+            body = _extract_body(payload)
+            if len(body) > BODY_MAX_CHARS:
+                body = body[:BODY_MAX_CHARS] + " …[truncated]"
 
             emails.append({
                 "id": msg_meta["id"],
@@ -84,6 +160,7 @@ def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
                 "from": headers.get("From", "unknown"),
                 "date": headers.get("Date", ""),
                 "snippet": snippet,
+                "body": body,
             })
         except Exception:
             continue
@@ -149,9 +226,19 @@ def _analyze_batch(emails: list[dict], offset: int) -> list[dict]:
         email_text += f"Subject: {e['subject']}\n"
         email_text += f"From: {e['from']}\n"
         email_text += f"Date: {e['date']}\n"
-        email_text += f"Snippet: {e['snippet']}\n"
+        body = e.get("body") or e.get("snippet", "")
+        email_text += f"Body: {body}\n"
 
     prompt = f"""You are analyzing a student's inbox for internship and job-related emails.
+
+CLASSIFICATION PRIORITY:
+- The SUBJECT line is the PRIMARY signal — decide relevance based on the subject first.
+- The body is for ADDITIONAL CONTEXT only (e.g. application term dates, company name,
+  status of application). Do NOT use the body to second-guess the subject.
+- Job-alert emails (LinkedIn, Glassdoor, Jobright) typically feature ONE headline job in
+  the subject and list OTHER suggested jobs in the body — IGNORE the "More jobs you might
+  like / Other recommendations / Related jobs" sections in the body. Only the headline
+  job in the subject matters.
 
 For each email, determine if it is one of:
 - Internship / co-op / stage / stagiaire job postings (STUDENT positions only)
@@ -160,38 +247,42 @@ For each email, determine if it is one of:
 - Interview invitations or follow-ups for an internship
 
 STRICT RULES — these MUST be followed:
-1. ONLY include actual internship/co-op/stage/stagiaire positions. The subject or snippet
+1. ONLY include actual internship/co-op/stage/stagiaire positions. The SUBJECT
    MUST explicitly mention one of: "intern", "internship", "stage", "stagiaire", "co-op",
-   "coop", or "student". If none of these words appear, EXCLUDE the email.
+   "coop", or "student". If none of these words appear in the subject, EXCLUDE the email.
 2. EXCLUDE all full-time roles, including "junior", "senior", "mid-level", "lead",
    "associate", "engineer", "developer", "analyst", or "specialist" positions when they
    are NOT explicitly labeled as an internship.
-3. For job-aggregator emails (LinkedIn, Glassdoor, Jobright, Indeed Job Alerts):
-   - The aggregator email is RELEVANT ONLY if the lead/headline job title in the subject
-     is explicitly an internship/co-op/stage.
-   - Digest emails like "Java Developer at X and 7 more jobs" are EXCLUDED unless that
-     lead job itself is explicitly an internship.
-   - "Junior Data Engineer", "Senior Full Stack", "Application Engineer" without
-     "intern/stage/co-op" qualifier → EXCLUDE.
-4. Application confirmations, recruiter messages, and status updates from companies
+3. Application confirmations, recruiter messages, and status updates from companies
    directly (e.g. PCL, WSP, Staples, Indeed Apply confirmations) about YOUR internship
    applications ARE relevant and should be included.
-5. EXCLUDE any internship explicitly for "Fall 2026" / "Automne 2026" / "F2026"
-   (the student is not looking for fall positions). If the subject or snippet
-   mentions Fall 2026 as the term, EXCLUDE the email even if it's an internship.
-6. IGNORE newsletters, promotional emails, Quora digests, and unrelated content.
+4. EXCLUDE any internship explicitly for "Fall 2026" / "Automne 2026" / "F2026"
+   (the student is not looking for fall positions). If the subject or body mentions
+   Fall 2026 as the term, EXCLUDE the email even if it's an internship.
+5. IGNORE newsletters, promotional emails, Quora digests, and unrelated content.
 
-Return a JSON object with a single key "results" whose value is an array.
-For each RELEVANT email, include an object in the array with these fields:
-- "email_index": the email number shown above (integer)
-- "subject": the email subject
-- "from": sender
-- "date": date
-- "company": company name if identifiable, or null
-- "category": one of "internship", "recruiter", "confirmation", "reply", "status"
-- "summary": 1-2 sentence summary
-- "action_items": array of action items (strings), or empty array
-- "priority": "high", "medium", or "low"
+OUTPUT FORMAT — return a JSON object with EXACTLY this shape:
+{{
+  "results": [
+    {{
+      "email_index": 1,
+      "subject": "...",
+      "from": "...",
+      "date": "...",
+      "company": "Flare",
+      "category": "internship",
+      "summary": "...",
+      "action_items": ["Apply to the internship"],
+      "priority": "high"
+    }}
+  ]
+}}
+
+Use EXACTLY these field names — do NOT rename "results" to "jobs"/"emails", and do NOT
+rename "subject" to "job_title". Keep the field names verbatim.
+
+Allowed values for "category": "internship", "recruiter", "confirmation", "reply", "status".
+Allowed values for "priority": "high", "medium", "low".
 
 If NO emails in this batch are relevant, return: {{"results": []}}
 
@@ -211,12 +302,71 @@ Emails:
     )
     r.raise_for_status()
     raw = r.json().get("response", "").strip()
+    if DEBUG:
+        print(f"\n  ----- RAW LLM RESPONSE (emails {offset}-{offset + len(emails) - 1}) -----")
+        print(f"  {raw}")
+        print(f"  ----- END RAW -----\n")
     parsed = json.loads(raw)
-    if isinstance(parsed, dict):
-        return parsed.get("results", []) or []
+    items = _extract_results_array(parsed)
+    # Normalize field names that the model sometimes invents
+    return [_normalize_result(item) for item in items]
+
+
+def _extract_results_array(parsed) -> list:
+    """Find the array of results regardless of which top-level key the model chose."""
     if isinstance(parsed, list):
         return parsed
+    if not isinstance(parsed, dict):
+        return []
+    # Common keys the model might pick
+    for key in ("results", "jobs", "emails", "items", "data", "matches"):
+        val = parsed.get(key)
+        if isinstance(val, list):
+            return val
+    # Fall back: any list value in the dict
+    for val in parsed.values():
+        if isinstance(val, list) and val and isinstance(val[0], dict):
+            return val
+    # Maybe the model returned a single object instead of an array
+    if any(k in parsed for k in ("subject", "job_title", "email_index")):
+        return [parsed]
     return []
+
+
+VALID_CATEGORIES = {"internship", "recruiter", "confirmation", "reply", "status"}
+VALID_PRIORITIES = {"high", "medium", "low"}
+
+
+def _normalize_result(item: dict) -> dict:
+    """Map common alternative field names to the canonical ones."""
+    if not isinstance(item, dict):
+        return {}
+    aliases = {
+        "subject": ("subject", "job_title", "title", "headline"),
+        "from": ("from", "sender", "source"),
+        "company": ("company", "employer", "organization"),
+        "category": ("category", "type", "kind"),
+        "summary": ("summary", "description", "details"),
+        "action_items": ("action_items", "actions", "next_steps", "todos"),
+        "priority": ("priority", "importance"),
+        "email_index": ("email_index", "index", "id", "number"),
+        "date": ("date", "received"),
+    }
+    out: dict = {}
+    for canonical, alts in aliases.items():
+        for a in alts:
+            if a in item and item[a] is not None:
+                out[canonical] = item[a]
+                break
+    # Validate category and priority; coerce unknown values to defaults
+    cat = str(out.get("category", "")).lower()
+    out["category"] = cat if cat in VALID_CATEGORIES else "internship"
+    pri = str(out.get("priority", "")).lower()
+    out["priority"] = pri if pri in VALID_PRIORITIES else "medium"
+    out.setdefault("action_items", [])
+    out.setdefault("summary", "")
+    out.setdefault("company", None)
+    return out
 
 
 AGGREGATOR_SENDERS = (
@@ -256,7 +406,7 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
     if not emails:
         return []
 
-    BATCH_SIZE = 10
+    BATCH_SIZE = 5
     results: list[dict] = []
     total_batches = (len(emails) + BATCH_SIZE - 1) // BATCH_SIZE
 
@@ -273,28 +423,71 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
         except requests.RequestException as e:
             print(f"  [!] Batch {b+1} request failed, skipping: {e}")
 
+    # Build subject lookup for fallback when email_index is missing
+    by_subject: dict[str, dict] = {}
+    for e in emails:
+        key = (e.get("subject") or "").strip().lower()
+        if key:
+            by_subject[key] = e
+
     # Safety filters
     filtered = []
+    seen_subjects: set[str] = set()
     dropped_aggregator = 0
     dropped_term = 0
+    dropped_dup = 0
+    dropped_unmatched = 0
     for r in results:
-        if _is_aggregator(r.get("from", "")) and not _subject_mentions_internship(r.get("subject", "")):
+        # Look up the original email so we filter against the REAL sender/body,
+        # not whatever the LLM rewrote them as. Try email_index first, fall back to subject.
+        idx = r.get("email_index")
+        original = None
+        if isinstance(idx, int) and 1 <= idx <= len(emails):
+            original = emails[idx - 1]
+        else:
+            key = (r.get("subject") or "").strip().lower()
+            original = by_subject.get(key)
+
+        if original is None:
+            # The LLM made up an email that doesn't exist in the input — drop it
+            dropped_unmatched += 1
+            continue
+
+        # Replace LLM-rewritten fields with the originals
+        r["from"] = original.get("from", "")
+        r["subject"] = original.get("subject", "")
+        r["date"] = original.get("date", "")
+
+        sender = r["from"]
+        subject = r["subject"]
+
+        if _is_aggregator(sender) and not _subject_mentions_internship(subject):
             dropped_aggregator += 1
             continue
-        # Pull the original snippet so we can also filter on body text
-        idx = r.get("email_index")
-        snippet = ""
-        if isinstance(idx, int) and 1 <= idx <= len(emails):
-            snippet = emails[idx - 1].get("snippet", "")
-        if _mentions_excluded_term(r.get("subject", ""), r.get("summary", ""), snippet):
+
+        snippet = original.get("snippet", "")
+        body = original.get("body", "")
+        if _mentions_excluded_term(subject, r.get("summary", ""), snippet, body):
             dropped_term += 1
             continue
+
+        # Dedupe hallucinated duplicates within the batch
+        key = subject.strip().lower()
+        if key and key in seen_subjects:
+            dropped_dup += 1
+            continue
+        seen_subjects.add(key)
+
         filtered.append(r)
 
     if dropped_aggregator:
         print(f"  Filtered out {dropped_aggregator} aggregator email(s) without internship keywords")
     if dropped_term:
         print(f"  Filtered out {dropped_term} email(s) mentioning excluded term (e.g. Fall 2026)")
+    if dropped_dup:
+        print(f"  Filtered out {dropped_dup} duplicate email(s) (LLM hallucination)")
+    if dropped_unmatched:
+        print(f"  Filtered out {dropped_unmatched} unmatched result(s) (LLM hallucination)")
 
     return filtered
 
@@ -379,7 +572,7 @@ def export_json(results: list[dict], path: str):
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    global OLLAMA_MODEL
+    global OLLAMA_MODEL, DEBUG
     parser = argparse.ArgumentParser(
         description="Scan Gmail for internship opportunities using a local LLM."
     )
@@ -413,10 +606,16 @@ def main():
         action="store_true",
         help="Scan all emails (default: unread only)"
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print raw LLM response for each batch"
+    )
     args = parser.parse_args()
 
     if args.model:
         OLLAMA_MODEL = args.model
+    DEBUG = args.debug
 
     print(f"\n{BOLD}Internship Scanner{RESET}")
     print(f"{DIM}Local analysis with {OLLAMA_MODEL} via Ollama{RESET}\n")
