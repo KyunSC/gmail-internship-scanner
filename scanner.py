@@ -310,18 +310,22 @@ OUTPUT FORMAT — return a JSON object with EXACTLY this shape:
 {{
   "results": [
     {{
-      "email_index": 1,
-      "subject": "...",
-      "from": "...",
-      "date": "...",
-      "company": "Flare",
+      "email_index": <integer index from the email block>,
+      "subject": "<copy the subject verbatim>",
+      "from": "<copy the from verbatim>",
+      "date": "<copy the date verbatim>",
+      "company": "<extract the hiring company name from THIS email's body — do not invent>",
       "category": "internship",
-      "summary": "...",
-      "action_items": ["Apply to the internship"],
+      "summary": "<short summary of THIS email only>",
+      "action_items": ["..."],
       "priority": "high"
     }}
   ]
 }}
+
+CRITICAL: Each result must reflect the corresponding email's content. Do NOT mix
+information across emails in the batch. Do NOT use placeholder/example values
+verbatim. If you cannot determine the company from the email body, set company to null.
 
 Use EXACTLY these field names — do NOT rename "results" to "jobs"/"emails", and do NOT
 rename "subject" to "job_title". Keep the field names verbatim.
@@ -341,7 +345,7 @@ Emails:
             "prompt": prompt,
             "stream": False,
             "format": "json",
-            "options": {"temperature": 0.1, "num_predict": 4096},
+            "options": {"temperature": 0, "num_predict": 4096},
         },
         timeout=180,
     )
@@ -502,6 +506,17 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
         r["from"] = original.get("from", "")
         r["subject"] = original.get("subject", "")
         r["date"] = original.get("date", "")
+
+        # Validate company against the email — null it out if the LLM hallucinated.
+        company = r.get("company")
+        if isinstance(company, str) and company.strip():
+            haystack = " ".join([
+                original.get("body", ""),
+                original.get("subject", ""),
+                original.get("from", ""),
+            ]).lower()
+            if company.strip().lower() not in haystack:
+                r["company"] = None
 
         sender = r["from"]
         subject = r["subject"]
