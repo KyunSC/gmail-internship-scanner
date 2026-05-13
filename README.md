@@ -8,7 +8,7 @@ Scans your Gmail for internship/co-op opportunities and analyzes them **locally*
 Gmail (Google servers) --API--> Your machine --Ollama--> Results (local only)
 ```
 
-- **Gmail API** fetches email metadata + snippets (read-only, OAuth2)
+- **Gmail API** fetches email metadata + full bodies (read-only, OAuth2)
 - **Ollama** runs an LLM locally to classify and summarize
 - Nothing is sent to any third-party AI service
 
@@ -28,10 +28,10 @@ curl -fsSL https://ollama.com/install.sh | sh
 # Windows: download from https://ollama.com/download
 ```
 
-Pull a model (qwen2.5:7b is a good balance of speed and quality):
+Pull a model (qwen2.5:14b is the recommended default — larger models produce fewer JSON-format errors):
 
 ```bash
-ollama pull qwen2.5:7b
+ollama pull qwen2.5:14b
 ```
 
 Start the server (if not already running):
@@ -53,7 +53,7 @@ ollama serve
    - If prompted, configure the consent screen (External is fine for personal use; add your email as a test user)
    - Application type: **Desktop app**
    - Download the JSON file
-5. Rename the downloaded file to `credentials.json` and place it in this folder
+5. Rename the downloaded file to [credentials.json](credentials.json) and place it in this folder
 
 ### 3. Install Python dependencies
 
@@ -65,11 +65,13 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Scan recent emails (last 30 days)
+### Scan recent unread emails (last 30 days)
 
 ```bash
 python scanner.py
 ```
+
+By default, only **unread** emails are scanned. Use `--all` to include read emails too.
 
 ### Search by keyword
 
@@ -84,9 +86,11 @@ python scanner.py -k "EXFO"
 |------|-------------|---------|
 | `-k`, `--keyword` | Search keyword | (none, scans recent) |
 | `-d`, `--days` | Days to look back | 30 |
-| `-m`, `--model` | Ollama model name | llama3.1:8b |
-| `-n`, `--max-emails` | Max emails per query | 30 |
+| `-m`, `--model` | Ollama model name | `llama3.1:8b` |
+| `-n`, `--max-emails` | Max emails to fetch per query | 30 |
 | `-o`, `--output` | Export results to JSON | (none) |
+| `--all` | Scan all emails, not just unread | unread only |
+| `--debug` | Print the raw LLM response for each batch | off |
 
 ### Examples
 
@@ -94,28 +98,41 @@ python scanner.py -k "EXFO"
 # Scan last 60 days
 python scanner.py -d 60
 
-# Use a different model
-python scanner.py -m mistral:7b
+# Scan everything (read + unread)
+python scanner.py --all
+
+# Use the recommended 14b model
+python scanner.py -m qwen2.5:14b
 
 # Search and export to file
 python scanner.py -k "internship" -o results.json
 
-# Use a larger model for better analysis
-python scanner.py -m llama3.1:70b
+# Debug a flaky batch
+python scanner.py --debug
 ```
 
 ### Environment variables
 
 ```bash
 OLLAMA_URL=http://localhost:11434   # Ollama server URL
-OLLAMA_MODEL=llama3.1:8b           # Default model
+OLLAMA_MODEL=llama3.1:8b            # Default model (override with -m)
 ```
+
+---
+
+## How it works
+
+1. **Fetch** — runs several targeted Gmail queries (internship/co-op/stage keywords, application/interview subjects, recruiter senders) and deduplicates by message ID.
+2. **Normalize** — extracts plain-text bodies from MIME parts, strips HTML/URLs/zero-width characters, and truncates to 5000 chars. Aggregator emails (Glassdoor, Jobright) are rewritten so the LLM sees the headline job rather than the "more jobs you might like" recommendations block.
+3. **Classify** — emails are sent to Ollama in batches of 5 with a strict prompt that requires the subject to mention an internship keyword.
+4. **Filter** — results are validated against the originals: aggregator emails without internship keywords in the subject are dropped, Fall 2026 / Automne 2026 listings are excluded, hallucinated companies are nulled out, and duplicate subjects are removed.
+5. **Display** — results are sorted by priority and color-coded by category (internship / recruiter / confirmation / reply / status).
 
 ---
 
 ## First run
 
-On first run, a browser window will open asking you to authorize Gmail read access. After authorizing, a `token.json` file is saved locally so you don't need to re-auth each time.
+On first run, a browser window will open asking you to authorize Gmail read access. After authorizing, a [token.json](token.json) file is saved locally so you don't need to re-auth each time.
 
 **The app only requests read-only access** -- it cannot send, delete, or modify your emails.
 
@@ -125,11 +142,14 @@ On first run, a browser window will open asking you to authorize Gmail read acce
 
 | Model | RAM needed | Speed | Quality |
 |-------|-----------|-------|---------|
+| `qwen2.5:14b` | ~10 GB | Medium | Very good (recommended) |
+| `qwen2.5:7b` | ~5 GB | Fast | Good |
 | `llama3.1:8b` | ~6 GB | Fast | Good |
 | `mistral:7b` | ~5 GB | Fast | Good |
-| `llama3.1:70b` | ~40 GB | Slow | Excellent |
 | `gemma2:9b` | ~7 GB | Fast | Good |
-| `qwen2.5:7b` | ~5 GB | Fast | Good |
+| `llama3.1:70b` | ~40 GB | Slow | Excellent |
+
+Smaller models (7b/8b) occasionally return malformed JSON or rename the expected `results` key — the scanner tolerates this and skips bad batches, but you'll get more usable hits per run on a 14b+ model.
 
 ---
 
@@ -137,5 +157,5 @@ On first run, a browser window will open asking you to authorize Gmail read acce
 
 - Email content is fetched from Gmail via Google's official API (HTTPS, OAuth2)
 - All analysis runs locally through Ollama -- no data is sent to OpenAI, Anthropic, or any other AI provider
-- `credentials.json` and `token.json` stay on your machine
-- Add both to `.gitignore` if you version-control this folder
+- [credentials.json](credentials.json) and [token.json](token.json) stay on your machine
+- Both are already in [.gitignore](.gitignore)

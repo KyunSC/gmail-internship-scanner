@@ -277,13 +277,11 @@ def _analyze_batch(emails: list[dict], offset: int) -> list[dict]:
     prompt = f"""You are analyzing a student's inbox for internship and job-related emails.
 
 CLASSIFICATION PRIORITY:
-- The SUBJECT line is the PRIMARY signal — decide relevance based on the subject first.
-- The body is for ADDITIONAL CONTEXT only (e.g. application term dates, company name,
-  status of application). Do NOT use the body to second-guess the subject.
-- Job-alert emails (LinkedIn, Glassdoor, Jobright) typically feature ONE headline job in
-  the subject and list OTHER suggested jobs in the body — IGNORE the "More jobs you might
-  like / Other recommendations / Related jobs" sections in the body. Only the headline
-  job in the subject matters.
+- Combine signals from the SUBJECT, BODY, and SENDER. No single field is decisive on
+  its own. Strong signals: subject keywords (intern/co-op/stage/student), body content
+  describing a student role, sender being a recruiter or career address.
+- For job-alert aggregators (LinkedIn, Glassdoor, Jobright), the body has been pre-trimmed
+  to the headline job only. IGNORE any remaining "More jobs you might like" sections.
 
 For each email, determine if it is one of:
 - Internship / co-op / stage / stagiaire job postings (STUDENT positions only)
@@ -292,9 +290,14 @@ For each email, determine if it is one of:
 - Interview invitations or follow-ups for an internship
 
 STRICT RULES — these MUST be followed:
-1. ONLY include actual internship/co-op/stage/stagiaire positions. The SUBJECT
-   MUST explicitly mention one of: "intern", "internship", "stage", "stagiaire", "co-op",
-   "coop", or "student". If none of these words appear in the subject, EXCLUDE the email.
+1. ONLY include actual internship/co-op/stage/stagiaire/student positions. At least ONE
+   of the following signals must apply:
+   (a) Subject mentions "intern", "internship", "stage", "stagiaire", "co-op", "coop",
+       or "student"
+   (b) Body clearly describes a student/intern/co-op position
+   (c) The email is recruiter outreach or application status for an internship from
+       a company or career address
+   If NONE of these signals apply, EXCLUDE.
 2. EXCLUDE all full-time roles, including "junior", "senior", "mid-level", "lead",
    "associate", "engineer", "developer", "analyst", or "specialist" positions when they
    are NOT explicitly labeled as an internship.
@@ -435,14 +438,45 @@ EXCLUDE_TERM_PATTERNS = (
 )
 
 
+RECRUITER_SENDER_HINTS = (
+    "talent@", "careers@", "career@", "hr@", "recruiter@", "recruiting@",
+    "hiring@", "jobs@", "noreply@", "no-reply@",
+    "lever.co", "greenhouse.io", "workday.com", "myworkday.com",
+    "icims.com", "smartrecruiters", "ashbyhq", "bamboohr",
+    "successfactors", "taleo.net",
+)
+
+
 def _is_aggregator(sender: str) -> bool:
     s = (sender or "").lower()
     return any(domain in s for domain in AGGREGATOR_SENDERS)
 
 
+def _is_recruiter_sender(sender: str) -> bool:
+    """Recruiter/career-address senders worth keeping even without a subject keyword
+    (e.g. application status updates, interview invites)."""
+    s = (sender or "").lower()
+    return any(h in s for h in RECRUITER_SENDER_HINTS)
+
+
 def _subject_mentions_internship(subject: str) -> bool:
     s = (subject or "").lower()
     return any(kw in s for kw in INTERNSHIP_KEYWORDS)
+
+
+def _body_mentions_internship(body: str) -> bool:
+    b = (body or "").lower()
+    return any(kw in b for kw in INTERNSHIP_KEYWORDS)
+
+
+def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
+    """Combined signal check: keep if subject OR body has an internship keyword,
+    or if the sender is a recruiter/career address. The sender-only signal does NOT
+    count for aggregators (Glassdoor/LinkedIn/etc.) because their noreply addresses
+    would otherwise let every digest through."""
+    if _subject_mentions_internship(subject) or _body_mentions_internship(body):
+        return True
+    return _is_recruiter_sender(sender) and not _is_aggregator(sender)
 
 
 def _mentions_excluded_term(*texts: str) -> bool:
@@ -520,12 +554,15 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
 
         sender = r["from"]
         subject = r["subject"]
+        body = original.get("body", "")
 
-        if _is_aggregator(sender) and not _subject_mentions_internship(subject):
+        # Drop only if there's no internship signal anywhere — subject, body, or sender.
+        # Aggregators (Glassdoor, LinkedIn, Jobright) get the strictest application of
+        # this since they spam digests; other senders pass through to the next filters.
+        if _is_aggregator(sender) and not _has_internship_signal(subject, body, sender):
             dropped_aggregator += 1
             continue
 
-        body = original.get("body", "")
         if _mentions_excluded_term(subject, r.get("summary", ""), body):
             dropped_term += 1
             continue
