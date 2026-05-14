@@ -196,8 +196,8 @@ def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
             headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
             subject = headers.get("Subject", "(no subject)")
             sender = headers.get("From", "unknown")
-            body = _extract_body(payload)
-            subject, body = _normalize_aggregator_email(sender, subject, body)
+            body_full = _extract_body(payload)
+            subject, body = _normalize_aggregator_email(sender, subject, body_full)
             if len(body) > BODY_MAX_CHARS:
                 body = body[:BODY_MAX_CHARS] + " …[truncated]"
 
@@ -207,6 +207,7 @@ def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
                 "from": sender,
                 "date": headers.get("Date", ""),
                 "body": body,
+                "body_full": body_full,
             })
         except Exception:
             continue
@@ -304,10 +305,7 @@ STRICT RULES — these MUST be followed:
 3. Application confirmations, recruiter messages, and status updates from companies
    directly (e.g. PCL, WSP, Staples, Indeed Apply confirmations) about YOUR internship
    applications ARE relevant and should be included.
-4. EXCLUDE any internship explicitly for "Fall 2026" / "Automne 2026" / "F2026"
-   (the student is not looking for fall positions). If the subject or body mentions
-   Fall 2026 as the term, EXCLUDE the email even if it's an internship.
-5. IGNORE newsletters, promotional emails, Quora digests, and unrelated content.
+4. IGNORE newsletters, promotional emails, Quora digests, and unrelated content.
 
 OUTPUT FORMAT — return a JSON object with EXACTLY this shape:
 {{
@@ -432,11 +430,6 @@ INTERNSHIP_KEYWORDS = (
     "intern", "internship", "stage", "stagiaire", "co-op", "coop", "student",
 )
 
-EXCLUDE_TERM_PATTERNS = (
-    "fall 2026", "fall2026", "f2026", "f-2026",
-    "automne 2026", "automne2026", "a2026", "a-2026",
-)
-
 
 RECRUITER_SENDER_HINTS = (
     "talent@", "careers@", "career@", "hr@", "recruiter@", "recruiting@",
@@ -479,9 +472,22 @@ def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
     return _is_recruiter_sender(sender) and not _is_aggregator(sender)
 
 
-def _mentions_excluded_term(*texts: str) -> bool:
-    blob = " ".join(t.lower() for t in texts if t)
-    return any(pat in blob for pat in EXCLUDE_TERM_PATTERNS)
+def _body_snippet_around(body: str, keyword: str, window: int = 120) -> str:
+    """Return ~window chars of body context around the first case-insensitive
+    occurrence of keyword, for surfacing internships found in aggregator tails."""
+    if not body or not keyword:
+        return ""
+    idx = body.lower().find(keyword.lower())
+    if idx < 0:
+        return ""
+    start = max(0, idx - window)
+    end = min(len(body), idx + len(keyword) + window)
+    snippet = body[start:end].strip()
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(body):
+        snippet = snippet + "…"
+    return snippet
 
 
 def analyze_with_ollama(emails: list[dict]) -> list[dict]:
@@ -513,11 +519,12 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
         if key:
             by_subject[key] = e
 
+    index_by_id: dict[str, int] = {e["id"]: i + 1 for i, e in enumerate(emails) if e.get("id")}
+
     # Safety filters
     filtered = []
-    seen_subjects: set[str] = set()
+    seen_indices: set[int] = set()
     dropped_aggregator = 0
-    dropped_term = 0
     dropped_dup = 0
     dropped_unmatched = 0
     for r in results:
@@ -525,11 +532,15 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
         # not whatever the LLM rewrote them as. Try email_index first, fall back to subject.
         idx = r.get("email_index")
         original = None
+        match_idx: int | None = None
         if isinstance(idx, int) and 1 <= idx <= len(emails):
             original = emails[idx - 1]
+            match_idx = idx
         else:
             key = (r.get("subject") or "").strip().lower()
             original = by_subject.get(key)
+            if original is not None:
+                match_idx = index_by_id.get(original.get("id", ""))
 
         if original is None:
             # The LLM made up an email that doesn't exist in the input — drop it
@@ -563,30 +574,60 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
             dropped_aggregator += 1
             continue
 
-        if _mentions_excluded_term(subject, r.get("summary", ""), body):
-            # Keep when the subject names an intern/student role — Fall 2026
-            # hits usually come from "More jobs you might like" tails in digests.
-            if not _subject_mentions_internship(subject):
-                dropped_term += 1
+        # Dedupe per-email: only drop if the LLM returned the same email twice.
+        # Distinct emails that happen to share a subject are kept.
+        if match_idx is not None:
+            if match_idx in seen_indices:
+                dropped_dup += 1
                 continue
-
-        # Dedupe hallucinated duplicates within the batch
-        key = subject.strip().lower()
-        if key and key in seen_subjects:
-            dropped_dup += 1
-            continue
-        seen_subjects.add(key)
+            seen_indices.add(match_idx)
 
         filtered.append(r)
 
+    # Deterministic recall: include any email whose subject OR full body mentions
+    # an internship keyword. The full body is used so we catch internships listed
+    # in aggregator "More jobs you might like" tails that the LLM was told to ignore.
+    recall_added = 0
+    for i, e in enumerate(emails):
+        match_idx = i + 1
+        if match_idx in seen_indices:
+            continue
+        subject = e.get("subject", "")
+        body_full = e.get("body_full", "") or e.get("body", "")
+        subject_hit = _subject_mentions_internship(subject)
+        body_hit_kw = next(
+            (kw for kw in INTERNSHIP_KEYWORDS if kw in body_full.lower()),
+            None,
+        )
+        if not (subject_hit or body_hit_kw):
+            continue
+        if subject_hit:
+            summary = "(recovered: subject mentions internship — LLM did not return)"
+        else:
+            snippet = _body_snippet_around(body_full, body_hit_kw)
+            summary = f"(recovered: body mentions '{body_hit_kw}') … {snippet}"
+        filtered.append({
+            "subject": subject,
+            "from": e.get("from", ""),
+            "date": e.get("date", ""),
+            "category": "internship",
+            "company": None,
+            "summary": summary,
+            "action_items": [],
+            "priority": "medium",
+            "email_index": match_idx,
+        })
+        seen_indices.add(match_idx)
+        recall_added += 1
+
     if dropped_aggregator:
         print(f"  Filtered out {dropped_aggregator} aggregator email(s) without internship keywords")
-    if dropped_term:
-        print(f"  Filtered out {dropped_term} email(s) mentioning excluded term (e.g. Fall 2026)")
     if dropped_dup:
         print(f"  Filtered out {dropped_dup} duplicate email(s) (LLM hallucination)")
     if dropped_unmatched:
         print(f"  Filtered out {dropped_unmatched} unmatched result(s) (LLM hallucination)")
+    if recall_added:
+        print(f"  Recovered {recall_added} email(s) via deterministic recall pass")
 
     return filtered
 
