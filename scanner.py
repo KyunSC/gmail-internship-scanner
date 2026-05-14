@@ -22,10 +22,26 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 # Gmail API scope (read-only)
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPE_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
+SCOPE_MODIFY = "https://www.googleapis.com/auth/gmail.modify"
 
 TOKEN_PATH = Path(__file__).parent / "token.json"
 CREDS_PATH = Path(__file__).parent / "credentials.json"
+
+# Job-aggregator senders that --clean-inbox may mark as read. LinkedIn entries are
+# restricted to job-alert addresses (so newsletters / personal LinkedIn messages
+# are not touched).
+CLEAN_INBOX_SENDERS = (
+    "jobalerts-noreply@linkedin.com",
+    "jobs-listings@linkedin.com",
+    "jobs-noreply@linkedin.com",
+    "noreply@glassdoor.com",
+    "noreply@jobright.ai",
+    "alerts@ziprecruiter.com",
+    "noreply@ziprecruiter.com",
+    "alert@indeed.com",
+    "noreply@indeed.com",
+)
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
@@ -33,22 +49,37 @@ DEBUG = False
 
 # ── Gmail Auth ──────────────────────────────────────────────────────────────
 
-def get_gmail_service():
-    """Authenticate and return a Gmail API service instance."""
+def get_gmail_service(write_access: bool = False):
+    """Authenticate and return a Gmail API service instance.
+
+    write_access=True requests the gmail.modify scope so we can mark emails as
+    read. If the cached token only has readonly, we force a re-auth.
+    """
+    needed = [SCOPE_MODIFY] if write_access else [SCOPE_READONLY]
     creds = None
 
     if TOKEN_PATH.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        # Read the actual granted scopes from the file; from_authorized_user_file
+        # overrides creds.scopes with whatever we pass, so we can't rely on it.
+        granted = set(json.loads(TOKEN_PATH.read_text()).get("scopes", []))
+        if write_access and SCOPE_MODIFY not in granted:
+            # Token was issued under readonly only — force a fresh auth flow.
+            creds = None
+        else:
+            creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), needed)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except Exception:
+                creds = None
+        if not creds or not creds.valid:
             if not CREDS_PATH.exists():
                 print("\n[ERROR] credentials.json not found.")
                 print("Follow the setup instructions in README.md to create it.")
                 sys.exit(1)
-            flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_PATH), SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_PATH), needed)
             creds = flow.run_local_server(port=0)
 
         TOKEN_PATH.write_text(creds.to_json())
@@ -709,6 +740,87 @@ def export_json(results: list[dict], path: str):
     print(f"  Exported {len(results)} results to {path}")
 
 
+# ── Inbox cleanup ───────────────────────────────────────────────────────────
+
+def clean_inbox(service, results: list[dict], days: int = 30, apply: bool = False):
+    """Mark unread emails from job-aggregator senders as read IF they're not in
+    the scanner's results. Aggregator emails the scanner surfaced stay unread."""
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
+    sender_clauses = " OR ".join(f"from:{s}" for s in CLEAN_INBOX_SENDERS)
+    query = f"is:unread ({sender_clauses}) after:{cutoff}"
+
+    print(f"\n{BOLD}Inbox cleanup{RESET}")
+    print(f"  Querying unread aggregator emails: {query[:80]}…")
+
+    candidates: list[dict] = []
+    page_token = None
+    while True:
+        resp = service.users().messages().list(
+            userId="me", q=query, maxResults=500, pageToken=page_token
+        ).execute()
+        candidates.extend(resp.get("messages", []) or [])
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    # Keep-set: scanner's surfaced results, keyed by (from, date)
+    keep_keys = set()
+    for r in results:
+        sender = (r.get("from") or "").strip().lower()
+        date = (r.get("date") or "").strip()
+        if sender and date:
+            keep_keys.add((sender, date))
+
+    to_mark: list[dict] = []
+    kept_count = 0
+    kept_subject_safety = 0
+    for meta in candidates:
+        msg = service.users().messages().get(
+            userId="me", id=meta["id"], format="metadata",
+            metadataHeaders=["From", "Subject", "Date"],
+        ).execute()
+        headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+        sender_raw = headers.get("From", "")
+        date_raw = headers.get("Date", "")
+        subject = headers.get("Subject", "(no subject)")
+        if (sender_raw.strip().lower(), date_raw.strip()) in keep_keys:
+            kept_count += 1
+            continue
+        # Safety net: keep unread if subject mentions an internship keyword. Covers
+        # emails the scanner missed because its per-query result cap (30) cut them off.
+        if _subject_mentions_internship(subject):
+            kept_subject_safety += 1
+            continue
+        to_mark.append({"id": meta["id"], "from": sender_raw, "subject": subject, "date": date_raw})
+
+    print(f"  Found {len(candidates)} unread aggregator email(s); keeping {kept_count} (scanner-surfaced) "
+          f"+ {kept_subject_safety} (subject mentions internship); {len(to_mark)} to mark as read.\n")
+
+    if not to_mark:
+        print("  Nothing to mark.\n")
+        return
+
+    for m in to_mark[:30]:
+        print(f"  • {m['subject'][:70]}")
+        print(f"      {DIM}from {m['from']}  ·  {m['date']}{RESET}")
+    if len(to_mark) > 30:
+        print(f"  …and {len(to_mark) - 30} more")
+
+    if not apply:
+        print(f"\n  {DIM}(Dry run — re-run with --apply to mark these {len(to_mark)} emails as read){RESET}\n")
+        return
+
+    print(f"\n  Marking {len(to_mark)} email(s) as read…")
+    ids = [m["id"] for m in to_mark]
+    # batchModify cap is 1000 ids per call
+    for i in range(0, len(ids), 1000):
+        service.users().messages().batchModify(
+            userId="me",
+            body={"ids": ids[i:i + 1000], "removeLabelIds": ["UNREAD"]},
+        ).execute()
+    print(f"  Marked {len(to_mark)} email(s) as read\n")
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -751,6 +863,17 @@ def main():
         action="store_true",
         help="Print raw LLM response for each batch"
     )
+    parser.add_argument(
+        "--clean-inbox",
+        action="store_true",
+        help="After analysis, list unread aggregator emails (Glassdoor/LinkedIn/Jobright/ZipRecruiter/Indeed) "
+             "without internship content as read. Dry-run unless --apply is also given.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="With --clean-inbox, actually mark the emails as read (otherwise dry-run only).",
+    )
     args = parser.parse_args()
 
     if args.model:
@@ -765,9 +888,9 @@ def main():
     check_ollama()
     print(f"  Using model: {OLLAMA_MODEL}")
 
-    # Gmail auth
+    # Gmail auth (request modify scope only when needed)
     print("[2/3] Connecting to Gmail...")
-    service = get_gmail_service()
+    service = get_gmail_service(write_access=args.clean_inbox)
 
     # Search
     scope = "all emails" if args.all else "unread only"
@@ -793,6 +916,10 @@ def main():
     # Export
     if args.output:
         export_json(results, args.output)
+
+    # Inbox cleanup
+    if args.clean_inbox:
+        clean_inbox(service, results, days=args.days, apply=args.apply)
 
 
 if __name__ == "__main__":
