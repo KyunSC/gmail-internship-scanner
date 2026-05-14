@@ -564,8 +564,11 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
             continue
 
         if _mentions_excluded_term(subject, r.get("summary", ""), body):
-            dropped_term += 1
-            continue
+            # Keep when the subject names an intern/student role — Fall 2026
+            # hits usually come from "More jobs you might like" tails in digests.
+            if not _subject_mentions_internship(subject):
+                dropped_term += 1
+                continue
 
         # Dedupe hallucinated duplicates within the batch
         key = subject.strip().lower()
