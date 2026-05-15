@@ -202,7 +202,7 @@ def _normalize_aggregator_email(sender: str, subject: str, body: str) -> tuple[s
     return subject, body
 
 
-def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
+def search_emails(service, query: str, max_results: int = 100) -> list[dict]:
     """Search Gmail and return a list of simplified email dicts (with full body)."""
     try:
         result = service.users().messages().list(
@@ -246,16 +246,17 @@ def search_emails(service, query: str, max_results: int = 30) -> list[dict]:
     return emails
 
 
-def run_gmail_search(service, keyword: str = "", days: int = 30, unread_only: bool = True) -> list[dict]:
+def run_gmail_search(service, keyword: str = "", days: int = 30, unread_only: bool = True, max_results: int = 100) -> list[dict]:
     """Run multiple targeted searches and deduplicate results."""
+    intern_terms = "intern OR internship OR coop OR co-op OR stage OR stagiaire OR student"
     if keyword.strip():
         queries = [
-            f"{keyword} (internship OR co-op OR stage OR student OR stagiaire)",
+            f"{keyword} ({intern_terms})",
         ]
     else:
         cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
         queries = [
-            f"(internship OR co-op OR stage OR stagiaire) after:{cutoff}",
+            f"({intern_terms}) after:{cutoff}",
             f"subject:(application OR applied OR interview OR offer) after:{cutoff}",
             f"from:(recruiter OR talent OR hiring OR careers OR hr) after:{cutoff}",
         ]
@@ -266,7 +267,7 @@ def run_gmail_search(service, keyword: str = "", days: int = 30, unread_only: bo
     all_emails = {}
     for q in queries:
         print(f"  Searching: {q}")
-        for email in search_emails(service, q):
+        for email in search_emails(service, q, max_results=max_results):
             all_emails[email["id"]] = email  # dedupe by ID
 
     return list(all_emails.values())
@@ -461,6 +462,45 @@ INTERNSHIP_KEYWORDS = (
     "intern", "internship", "stage", "stagiaire", "co-op", "coop", "student",
 )
 
+# Terms for internships the user does NOT want surfaced (currently Fall 2026 /
+# September 2026 starts). Per-listing filter — we split aggregator digests into
+# individual job listings and drop the email only if EVERY intern listing in it
+# is Fall/Sept. If at least one Summer/other-term intern listing survives in the
+# same email, the email is kept.
+EXCLUDE_TERM_REGEX = re.compile(
+    r"\b(fall|automne)\b.{0,20}\b2026\b"
+    r"|\b2026\b.{0,20}\b(fall|automne)\b"
+    r"|\bsept(\.|ember|embre)?\s*\.?\s*2026\b"
+    r"|\b[fa][-\s]?2026\b",
+    re.IGNORECASE,
+)
+
+
+def _split_aggregator_listings(sender: str, body: str) -> list[str]:
+    """Split a digest body into per-listing chunks. Glassdoor uses ★ as the
+    listing separator (after each company's rating); Jobright closes each
+    recommendation with "APPLY NOW". Senders without a known digest format
+    return the whole body as a single chunk."""
+    s = (sender or "").lower()
+    if "glassdoor.com" in s and "★" in body:
+        return [c.strip() for c in body.split("★") if c.strip()]
+    if "jobright.ai" in s and "APPLY NOW" in body:
+        return [c.strip() for c in body.split("APPLY NOW") if c.strip()]
+    return [body]
+
+
+def _all_intern_listings_excluded(sender: str, body: str) -> bool:
+    """True if every chunk containing an internship keyword also matches the
+    Fall/Sept exclusion. False if any non-Fall intern listing exists, or if no
+    chunk has an intern keyword (in which case the filter shouldn't fire)."""
+    intern_chunks = [
+        c for c in _split_aggregator_listings(sender, body)
+        if any(kw in c.lower() for kw in INTERNSHIP_KEYWORDS)
+    ]
+    if not intern_chunks:
+        return False
+    return all(EXCLUDE_TERM_REGEX.search(c) for c in intern_chunks)
+
 
 RECRUITER_SENDER_HINTS = (
     "talent@", "careers@", "career@", "hr@", "recruiter@", "recruiting@",
@@ -558,6 +598,7 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
     dropped_aggregator = 0
     dropped_dup = 0
     dropped_unmatched = 0
+    dropped_term = 0
     for r in results:
         # Look up the original email so we filter against the REAL sender/body,
         # not whatever the LLM rewrote them as. Try email_index first, fall back to subject.
@@ -605,6 +646,16 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
             dropped_aggregator += 1
             continue
 
+        # Per-listing Fall 2026 / September 2026 exclusion (body only — subject
+        # is intentionally not checked). For digest aggregators the body is split
+        # into individual job listings; we drop the email only if EVERY intern
+        # listing in it is Fall/Sept. A mixed digest with one Summer intern still
+        # passes.
+        body_full = original.get("body_full", "") or body
+        if _all_intern_listings_excluded(sender, body_full):
+            dropped_term += 1
+            continue
+
         # Dedupe per-email: only drop if the LLM returned the same email twice.
         # Distinct emails that happen to share a subject are kept.
         if match_idx is not None:
@@ -632,6 +683,10 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
         )
         if not (subject_hit or body_hit_kw):
             continue
+        # Same per-listing Fall/September exclusion as the LLM result filter.
+        if _all_intern_listings_excluded(e.get("from", ""), body_full):
+            dropped_term += 1
+            continue
         if subject_hit:
             summary = "(recovered: subject mentions internship — LLM did not return)"
         else:
@@ -653,6 +708,8 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
 
     if dropped_aggregator:
         print(f"  Filtered out {dropped_aggregator} aggregator email(s) without internship keywords")
+    if dropped_term:
+        print(f"  Filtered out {dropped_term} email(s) whose body mentions Fall 2026 / September 2026")
     if dropped_dup:
         print(f"  Filtered out {dropped_dup} duplicate email(s) (LLM hallucination)")
     if dropped_unmatched:
@@ -850,8 +907,8 @@ def main():
     )
     parser.add_argument(
         "-n", "--max-emails",
-        type=int, default=30,
-        help="Max emails to fetch per query (default: 30)"
+        type=int, default=100,
+        help="Max emails to fetch per query (default: 100)"
     )
     parser.add_argument(
         "--all",
@@ -899,7 +956,7 @@ def main():
     else:
         print(f"  Scanning last {args.days} days ({scope})")
 
-    emails = run_gmail_search(service, keyword=args.keyword, days=args.days, unread_only=not args.all)
+    emails = run_gmail_search(service, keyword=args.keyword, days=args.days, unread_only=not args.all, max_results=args.max_emails)
     print(f"  Found {len(emails)} emails to analyze")
 
     if not emails:
