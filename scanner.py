@@ -44,7 +44,7 @@ CLEAN_INBOX_SENDERS = (
 )
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
 DEBUG = False
 
 # ── Gmail Auth ──────────────────────────────────────────────────────────────
@@ -161,47 +161,6 @@ def _extract_body(payload: dict) -> str:
 BODY_MAX_CHARS = 5000  # truncate to keep prompts manageable and skip footers
 
 
-# Glassdoor puts the headline job in the body ("Job alert: <Title> Your job listings ..."),
-# not in the subject — the subject typically lists unrelated "you might also like" jobs.
-GLASSDOOR_HEADLINE_RE = re.compile(r"Job alert:\s*(.+?)\s+Your job listings", re.IGNORECASE)
-
-
-def _normalize_aggregator_email(sender: str, subject: str, body: str) -> tuple[str, str]:
-    """Rewrite (subject, body) for aggregators where body recommendation sections
-    confuse the filters (e.g. Fall 2026 false positives) or where the real headline
-    isn't in the subject."""
-    sender_lower = (sender or "").lower()
-
-    if "glassdoor.com" in sender_lower:
-        # Glassdoor puts the headline in the body ("Job alert: X"); the subject
-        # lists unrelated "you might also like" jobs.
-        m = GLASSDOOR_HEADLINE_RE.search(body)
-        if not m:
-            return subject, body
-        headline = m.group(1).strip()
-        start = body.find("Job alert:")
-        # The Glassdoor headline section ends at the first "★" (the next job's rating).
-        end = body.find("★", start) if start != -1 else -1
-        if start != -1 and end != -1:
-            trimmed_body = body[start:end].strip()
-        elif start != -1:
-            trimmed_body = body[start:start + 200].strip()
-        else:
-            trimmed_body = body
-        return headline, trimmed_body
-
-    if "jobright.ai" in sender_lower:
-        # JobRight already has the headline in the subject, but the body appends a
-        # "More Great Matches" recommendations block that often contains Fall 2026
-        # listings — trim to the headline section (everything up to the first APPLY NOW).
-        apply_idx = body.find("APPLY NOW")
-        if apply_idx != -1:
-            return subject, body[:apply_idx].strip()
-        return subject, body
-
-    return subject, body
-
-
 def search_emails(service, query: str, max_results: int = 100) -> list[dict]:
     """Search Gmail and return a list of simplified email dicts (with full body)."""
     try:
@@ -227,8 +186,7 @@ def search_emails(service, query: str, max_results: int = 100) -> list[dict]:
             headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
             subject = headers.get("Subject", "(no subject)")
             sender = headers.get("From", "unknown")
-            body_full = _extract_body(payload)
-            subject, body = _normalize_aggregator_email(sender, subject, body_full)
+            body = _extract_body(payload)
             if len(body) > BODY_MAX_CHARS:
                 body = body[:BODY_MAX_CHARS] + " …[truncated]"
 
@@ -238,7 +196,6 @@ def search_emails(service, query: str, max_results: int = 100) -> list[dict]:
                 "from": sender,
                 "date": headers.get("Date", ""),
                 "body": body,
-                "body_full": body_full,
             })
         except Exception:
             continue
@@ -313,8 +270,9 @@ CLASSIFICATION PRIORITY:
 - Combine signals from the SUBJECT, BODY, and SENDER. No single field is decisive on
   its own. Strong signals: subject keywords (intern/co-op/stage/student), body content
   describing a student role, sender being a recruiter or career address.
-- For job-alert aggregators (LinkedIn, Glassdoor, Jobright), the body has been pre-trimmed
-  to the headline job only. IGNORE any remaining "More jobs you might like" sections.
+- For job-alert digest emails (LinkedIn, Glassdoor, Jobright), scan the ENTIRE body for
+  any internship/co-op/stage/student listing — not just the headline. Surface the email
+  if ANY listing in it is an internship, even if it appears in a recommendations section.
 
 For each email, determine if it is one of:
 - Internship / co-op / stage / stagiaire job postings (STUDENT positions only)
@@ -561,12 +519,28 @@ def _body_snippet_around(body: str, keyword: str, window: int = 120) -> str:
     return snippet
 
 
+BATCH_SIZE = 5
+
+
 def analyze_with_ollama(emails: list[dict]) -> list[dict]:
     """Send email metadata to Ollama for classification and summarization in batches."""
     if not emails:
         return []
 
-    BATCH_SIZE = 5
+    # Pre-filter: only send emails that have an internship signal in subject, body,
+    # or sender before hitting the LLM.
+    filtered_in = [
+        e for e in emails
+        if _has_internship_signal(e.get("subject", ""), e.get("body", ""), e.get("from", ""))
+    ]
+    dropped_pre = len(emails) - len(filtered_in)
+    if dropped_pre:
+        print(f"  Pre-filtered {dropped_pre} email(s) with no internship signal")
+    emails = filtered_in
+
+    if not emails:
+        return []
+
     results: list[dict] = []
     total_batches = (len(emails) + BATCH_SIZE - 1) // BATCH_SIZE
 
@@ -651,8 +625,8 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
         # into individual job listings; we drop the email only if EVERY intern
         # listing in it is Fall/Sept. A mixed digest with one Summer intern still
         # passes.
-        body_full = original.get("body_full", "") or body
-        if _all_intern_listings_excluded(sender, body_full):
+        body = original.get("body", "")
+        if _all_intern_listings_excluded(sender, body):
             dropped_term += 1
             continue
 
@@ -675,22 +649,22 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
         if match_idx in seen_indices:
             continue
         subject = e.get("subject", "")
-        body_full = e.get("body_full", "") or e.get("body", "")
+        body = e.get("body", "")
         subject_hit = _subject_mentions_internship(subject)
         body_hit_kw = next(
-            (kw for kw in INTERNSHIP_KEYWORDS if kw in body_full.lower()),
+            (kw for kw in INTERNSHIP_KEYWORDS if kw in body.lower()),
             None,
         )
         if not (subject_hit or body_hit_kw):
             continue
         # Same per-listing Fall/September exclusion as the LLM result filter.
-        if _all_intern_listings_excluded(e.get("from", ""), body_full):
+        if _all_intern_listings_excluded(e.get("from", ""), body):
             dropped_term += 1
             continue
         if subject_hit:
             summary = "(recovered: subject mentions internship — LLM did not return)"
         else:
-            snippet = _body_snippet_around(body_full, body_hit_kw)
+            snippet = _body_snippet_around(body, body_hit_kw)
             summary = f"(recovered: body mentions '{body_hit_kw}') … {snippet}"
         filtered.append({
             "subject": subject,
