@@ -12,19 +12,21 @@ from scanner import (
 )
 
 
-def rule_based_filter(emails: list[dict]) -> list[dict]:
-    """Pure keyword/rule-based filtering — no LLM involved."""
-    kept = []
+def rule_based_filter(emails: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Pure keyword/rule-based filtering — no LLM involved.
+    Returns (kept, dropped)."""
+    kept, dropped = [], []
     for e in emails:
         subject = e.get("subject", "")
         body = e.get("body", "")
         sender = e.get("from", "")
         if not _has_internship_signal(subject, body, sender):
-            continue
-        if _all_intern_listings_excluded(sender, body):
-            continue
-        kept.append(e)
-    return kept
+            dropped.append({**e, "_drop_reason": "no internship signal"})
+        elif _all_intern_listings_excluded(sender, body):
+            dropped.append({**e, "_drop_reason": "all listings are Fall 2026 / Sept 2026"})
+        else:
+            kept.append(e)
+    return kept, dropped
 
 
 def print_email_list(emails: list[dict], label: str, color: str = ""):
@@ -57,10 +59,21 @@ def main():
         return
 
     # ── Rule-based ──────────────────────────────────────────────────────────
-    rule_results = rule_based_filter(emails)
+    rule_results, dropped = rule_based_filter(emails)
     rule_subjects = {e.get("subject", "") for e in rule_results}
 
     print_email_list(rule_results, "RULE-BASED (keyword filter only)", color="\033[36m")
+
+    # ── Dropped ─────────────────────────────────────────────────────────────
+    print(f"\n\033[31m{BOLD}{'='*70}{RESET}")
+    print(f"\033[31m{BOLD}  DROPPED (no internship content)  ({len(dropped)} email(s)){RESET}")
+    print(f"\033[31m{BOLD}{'='*70}{RESET}")
+    for e in dropped:
+        print(f"  {BOLD}{e.get('subject','(no subject)')}{RESET}")
+        print(f"  {DIM}From: {e.get('from','')}{RESET}")
+        print(f"  {DIM}Date: {e.get('date','')}{RESET}")
+        print(f"  \033[31mReason: {e.get('_drop_reason','')}{RESET}")
+        print()
 
     # ── LLM-based ───────────────────────────────────────────────────────────
     print(f"\n{BOLD}Running LLM analysis…{RESET}")

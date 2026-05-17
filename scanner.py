@@ -420,6 +420,14 @@ INTERNSHIP_KEYWORDS = (
     "intern", "internship", "stage", "stagiaire", "co-op", "coop", "student",
 )
 
+# "stage" alone matches English "Late Stage", "Early Stage", etc.
+# Only treat it as an internship signal in the body when French context surrounds it.
+_STAGE_FRENCH_RE = re.compile(
+    r"(?:(?:un|de|du|en|le|la|au|bénévole|offre|recherche|cherche|propose)\s+stage\b"
+    r"|\bstage\s+(?:en|de|du|chez|pour|rémunéré|développeur|developer|informatique|logiciel|étudiant|pratique))",
+    re.IGNORECASE,
+)
+
 # Terms for internships the user does NOT want surfaced (currently Fall 2026 /
 # September 2026 starts). Per-listing filter — we split aggregator digests into
 # individual job listings and drop the email only if EVERY intern listing in it
@@ -453,7 +461,7 @@ def _all_intern_listings_excluded(sender: str, body: str) -> bool:
     chunk has an intern keyword (in which case the filter shouldn't fire)."""
     intern_chunks = [
         c for c in _split_aggregator_listings(sender, body)
-        if any(kw in c.lower() for kw in INTERNSHIP_KEYWORDS)
+        if _body_mentions_internship(c) or _subject_mentions_internship(c)
     ]
     if not intern_chunks:
         return False
@@ -488,7 +496,13 @@ def _subject_mentions_internship(subject: str) -> bool:
 
 def _body_mentions_internship(body: str) -> bool:
     b = (body or "").lower()
-    return any(kw in b for kw in INTERNSHIP_KEYWORDS)
+    for kw in INTERNSHIP_KEYWORDS:
+        if kw == "stage":
+            if _STAGE_FRENCH_RE.search(body):
+                return True
+        elif kw in b:
+            return True
+    return False
 
 
 def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
@@ -500,23 +514,6 @@ def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
         return True
     return _is_recruiter_sender(sender) and not _is_aggregator(sender)
 
-
-def _body_snippet_around(body: str, keyword: str, window: int = 120) -> str:
-    """Return ~window chars of body context around the first case-insensitive
-    occurrence of keyword, for surfacing internships found in aggregator tails."""
-    if not body or not keyword:
-        return ""
-    idx = body.lower().find(keyword.lower())
-    if idx < 0:
-        return ""
-    start = max(0, idx - window)
-    end = min(len(body), idx + len(keyword) + window)
-    snippet = body[start:end].strip()
-    if start > 0:
-        snippet = "…" + snippet
-    if end < len(body):
-        snippet = snippet + "…"
-    return snippet
 
 
 BATCH_SIZE = 5
@@ -640,46 +637,6 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
 
         filtered.append(r)
 
-    # Deterministic recall: include any email whose subject OR full body mentions
-    # an internship keyword. The full body is used so we catch internships listed
-    # in aggregator "More jobs you might like" tails that the LLM was told to ignore.
-    recall_added = 0
-    for i, e in enumerate(emails):
-        match_idx = i + 1
-        if match_idx in seen_indices:
-            continue
-        subject = e.get("subject", "")
-        body = e.get("body", "")
-        subject_hit = _subject_mentions_internship(subject)
-        body_hit_kw = next(
-            (kw for kw in INTERNSHIP_KEYWORDS if kw in body.lower()),
-            None,
-        )
-        if not (subject_hit or body_hit_kw):
-            continue
-        # Same per-listing Fall/September exclusion as the LLM result filter.
-        if _all_intern_listings_excluded(e.get("from", ""), body):
-            dropped_term += 1
-            continue
-        if subject_hit:
-            summary = "(recovered: subject mentions internship — LLM did not return)"
-        else:
-            snippet = _body_snippet_around(body, body_hit_kw)
-            summary = f"(recovered: body mentions '{body_hit_kw}') … {snippet}"
-        filtered.append({
-            "subject": subject,
-            "from": e.get("from", ""),
-            "date": e.get("date", ""),
-            "category": "internship",
-            "company": None,
-            "summary": summary,
-            "action_items": [],
-            "priority": "medium",
-            "email_index": match_idx,
-        })
-        seen_indices.add(match_idx)
-        recall_added += 1
-
     if dropped_aggregator:
         print(f"  Filtered out {dropped_aggregator} aggregator email(s) without internship keywords")
     if dropped_term:
@@ -688,8 +645,6 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
         print(f"  Filtered out {dropped_dup} duplicate email(s) (LLM hallucination)")
     if dropped_unmatched:
         print(f"  Filtered out {dropped_unmatched} unmatched result(s) (LLM hallucination)")
-    if recall_added:
-        print(f"  Recovered {recall_added} email(s) via deterministic recall pass")
 
     return filtered
 
