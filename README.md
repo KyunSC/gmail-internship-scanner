@@ -1,6 +1,6 @@
 # Internship Scanner (Local)
 
-Scans your Gmail for internship/co-op opportunities and analyzes them **locally** using Ollama. Your email content never leaves your machine (aside from the Gmail API fetch from Google, where it already lives).
+Scans your Gmail for internship/co-op opportunities and analyzes them **locally** using Ollama. Your email content never leaves your machine for your privacy (aside from the Gmail API fetch from Google, where it already lives).
 
 ## Architecture
 
