@@ -728,15 +728,22 @@ def export_json(results: list[dict], path: str):
 
 # ── Inbox cleanup ───────────────────────────────────────────────────────────
 
-def clean_inbox(service, results: list[dict], days: int = 30, apply: bool = False):
+def clean_inbox(service, results: list[dict], days: int = 30, apply: bool = False,
+                email_cache: dict | None = None):
     """Mark unread emails from job-aggregator senders as read IF they're not in
-    the scanner's results. Aggregator emails the scanner surfaced stay unread."""
+    the scanner's results. Aggregator emails the scanner surfaced stay unread.
+
+    email_cache: optional dict mapping message-id -> email dict (from run_gmail_search),
+    used to skip individual metadata API calls for already-fetched emails.
+    """
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
     sender_clauses = " OR ".join(f"from:{s}" for s in CLEAN_INBOX_SENDERS)
     query = f"is:unread ({sender_clauses}) after:{cutoff}"
 
     print(f"\n{BOLD}Inbox cleanup{RESET}")
     print(f"  Querying unread aggregator emails: {query[:80]}…")
+
+    cache = email_cache or {}
 
     candidates: list[dict] = []
     page_token = None
@@ -760,15 +767,25 @@ def clean_inbox(service, results: list[dict], days: int = 30, apply: bool = Fals
     to_mark: list[dict] = []
     kept_count = 0
     kept_subject_safety = 0
+    cache_hits = 0
     for meta in candidates:
-        msg = service.users().messages().get(
-            userId="me", id=meta["id"], format="metadata",
-            metadataHeaders=["From", "Subject", "Date"],
-        ).execute()
-        headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-        sender_raw = headers.get("From", "")
-        date_raw = headers.get("Date", "")
-        subject = headers.get("Subject", "(no subject)")
+        msg_id = meta["id"]
+        if msg_id in cache:
+            cached = cache[msg_id]
+            sender_raw = cached.get("from", "")
+            date_raw = cached.get("date", "")
+            subject = cached.get("subject", "(no subject)")
+            cache_hits += 1
+        else:
+            msg = service.users().messages().get(
+                userId="me", id=msg_id, format="metadata",
+                metadataHeaders=["From", "Subject", "Date"],
+            ).execute()
+            headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+            sender_raw = headers.get("From", "")
+            date_raw = headers.get("Date", "")
+            subject = headers.get("Subject", "(no subject)")
+
         if (sender_raw.strip().lower(), date_raw.strip()) in keep_keys:
             kept_count += 1
             continue
@@ -779,7 +796,8 @@ def clean_inbox(service, results: list[dict], days: int = 30, apply: bool = Fals
             continue
         to_mark.append({"id": meta["id"], "from": sender_raw, "subject": subject, "date": date_raw})
 
-    print(f"  Found {len(candidates)} unread aggregator email(s); keeping {kept_count} (scanner-surfaced) "
+    cache_note = f", {cache_hits} from cache" if cache_hits else ""
+    print(f"  Found {len(candidates)} unread aggregator email(s){cache_note}; keeping {kept_count} (scanner-surfaced) "
           f"+ {kept_subject_safety} (subject mentions internship); {len(to_mark)} to mark as read.\n")
 
     if not to_mark:
@@ -905,7 +923,8 @@ def main():
 
     # Inbox cleanup
     if args.clean_inbox:
-        clean_inbox(service, results, days=args.days, apply=args.apply)
+        email_cache = {e["id"]: e for e in emails if e.get("id")}
+        clean_inbox(service, results, days=args.days, apply=args.apply, email_cache=email_cache)
 
 
 if __name__ == "__main__":
