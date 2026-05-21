@@ -343,7 +343,7 @@ Emails:
             "format": "json",
             "options": {"temperature": temperature, "num_predict": 4096},
         },
-        timeout=180,
+        timeout=600,
     )
     r.raise_for_status()
     raw = r.json().get("response", "").strip()
