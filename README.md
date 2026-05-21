@@ -90,7 +90,7 @@ Scans unread emails from the last 30 days, classifies them with Ollama, and prin
 |------|-------------|---------|
 | `-k`, `--keyword` | Search keyword (e.g. `"EXFO"` or `"software intern Montreal"`) | (none) |
 | `-d`, `--days` | Days to look back | `30` |
-| `-m`, `--model` | Ollama model name | `qwen2.5:14b` |
+| `-m`, `--model` | Ollama model name | `qwen3.5:9b` |
 | `-n`, `--max-emails` | Max emails to fetch per query | `100` |
 | `-o`, `--output` | Export results to a JSON file | (none) |
 | `--all` | Include read emails, not just unread | unread only |
@@ -127,7 +127,7 @@ python scanner.py --debug
 
 ```bash
 OLLAMA_URL=http://localhost:11434   # Ollama server URL
-OLLAMA_MODEL=qwen2.5:14b            # Default model (override with -m)
+OLLAMA_MODEL=qwen3.5:9b             # Default model (override with -m)
 ```
 
 ---
