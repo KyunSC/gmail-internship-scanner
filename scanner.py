@@ -44,7 +44,7 @@ CLEAN_INBOX_SENDERS = (
 )
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:30b-a3b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:9b")
 DEBUG = False
 
 # ── Gmail Auth ──────────────────────────────────────────────────────────────
@@ -343,7 +343,7 @@ Emails:
             "format": "json",
             "options": {"temperature": temperature, "num_predict": 4096},
         },
-        timeout=600,
+        timeout=180,
     )
     r.raise_for_status()
     raw = r.json().get("response", "").strip()

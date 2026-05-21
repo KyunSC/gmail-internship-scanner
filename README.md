@@ -42,13 +42,11 @@ curl -fsSL https://ollama.com/install.sh | sh
 # Windows: download from https://ollama.com/download
 ```
 
-Pull a model. `qwen3:30b-a3b` is the recommended default — it's a Mixture-of-Experts model (~18 GB resident, ~3 B active per token) so it runs fast on Apple Silicon while reasoning at ~32 B-class quality on the buried-listing aggregator digests this scanner has to handle:
+Pull a model (`qwen3.5:9b` is the recommended default — newer generation, fits comfortably on 16 GB+ Macs):
 
 ```bash
-ollama pull qwen3:30b-a3b
+ollama pull qwen3.5:9b
 ```
-
-Smaller alternatives if you have ≤ 16 GB of RAM: `qwen2.5:14b` (~9 GB, the previous default) or `qwen2.5:7b` (~5 GB).
 
 Start the server (if not already running):
 
@@ -92,7 +90,7 @@ Scans unread emails from the last 30 days, classifies them with Ollama, and prin
 |------|-------------|---------|
 | `-k`, `--keyword` | Search keyword (e.g. `"EXFO"` or `"software intern Montreal"`) | (none) |
 | `-d`, `--days` | Days to look back | `30` |
-| `-m`, `--model` | Ollama model name | `qwen3:30b-a3b` |
+| `-m`, `--model` | Ollama model name | `qwen2.5:14b` |
 | `-n`, `--max-emails` | Max emails to fetch per query | `100` |
 | `-o`, `--output` | Export results to a JSON file | (none) |
 | `--all` | Include read emails, not just unread | unread only |
@@ -129,7 +127,7 @@ python scanner.py --debug
 
 ```bash
 OLLAMA_URL=http://localhost:11434   # Ollama server URL
-OLLAMA_MODEL=qwen3:30b-a3b          # Default model (override with -m)
+OLLAMA_MODEL=qwen2.5:14b            # Default model (override with -m)
 ```
 
 ---
@@ -213,15 +211,15 @@ python show_bodies.py
 
 | Model | RAM needed | Speed | Quality |
 |-------|-----------|-------|---------|
-| `qwen3:30b-a3b` | ~18 GB | Fast (MoE, only 3B active) | Excellent (recommended) |
-| `qwen2.5:14b` | ~10 GB | Medium | Very good |
+| `qwen2.5:14b` | ~10 GB | Medium | Very good (recommended) |
 | `qwen2.5:7b` | ~5 GB | Fast | Good |
 | `llama3.1:8b` | ~6 GB | Fast | Good |
 | `mistral:7b` | ~5 GB | Fast | Good |
 | `gemma2:9b` | ~7 GB | Fast | Good |
+| `qwen3:30b-a3b` | ~18 GB | Slow on ≤24 GB Macs (paging) | Excellent — but needs `iogpu.wired_limit_mb` bump or 32 GB+ RAM to be usable |
 | `llama3.1:70b` | ~40 GB | Slow | Excellent |
 
-Smaller models (7b/8b) occasionally return malformed JSON or rename expected keys — the scanner tolerates this and skips bad batches, but a 14b+ model gives more consistent results per run. The MoE option (`qwen3:30b-a3b`) is the sweet spot on 24 GB Macs: 32 B-class reasoning at roughly 14b-speed.
+Smaller models (7b/8b) occasionally return malformed JSON or rename expected keys — the scanner tolerates this and skips bad batches, but a 14b+ model gives more consistent results per run.
 
 ---
 
