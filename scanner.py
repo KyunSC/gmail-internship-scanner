@@ -44,7 +44,7 @@ CLEAN_INBOX_SENDERS = (
 )
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:30b-a3b")
 DEBUG = False
 
 # ── Gmail Auth ──────────────────────────────────────────────────────────────
@@ -254,8 +254,13 @@ def check_ollama():
         sys.exit(1)
 
 
-def _analyze_batch(emails: list[dict], offset: int) -> list[dict]:
-    """Analyze a single batch of emails. offset is the 1-based index of emails[0]."""
+def _analyze_batch(emails: list[dict], offset: int, temperature: float = 0.0) -> list[dict]:
+    """Analyze a single batch of emails. offset is the 1-based index of emails[0].
+
+    temperature=0 is the deterministic baseline. Non-zero gives sampling diversity,
+    used by the 2nd LLM pass to surface borderline emails the deterministic pass
+    missed (e.g. buried internships in aggregator digests).
+    """
     email_text = ""
     for i, e in enumerate(emails):
         email_text += f"\n--- Email {offset + i} ---\n"
@@ -336,7 +341,7 @@ Emails:
             "prompt": prompt,
             "stream": False,
             "format": "json",
-            "options": {"temperature": 0, "num_predict": 4096},
+            "options": {"temperature": temperature, "num_predict": 4096},
         },
         timeout=180,
     )
@@ -516,7 +521,14 @@ def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
 
 
 
-BATCH_SIZE = 5
+BATCH_SIZE = 1
+# Each batch is sent to the LLM with these per-pass temperatures and the
+# per-batch results are unioned (first-pass wins on conflicts). Pass 1 at
+# temperature 0 is the deterministic baseline; later passes at a small
+# temperature add sampling diversity to surface borderline emails (buried
+# internships in aggregator digests, in particular) the baseline missed.
+# Length controls how many passes run per batch.
+LLM_PASS_TEMPERATURES = (0.0, 0.5)
 
 
 def analyze_with_ollama(emails: list[dict]) -> list[dict]:
@@ -533,26 +545,46 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
     dropped_pre = len(emails) - len(filtered_in)
     if dropped_pre:
         print(f"  Pre-filtered {dropped_pre} email(s) with no internship signal")
-    emails = filtered_in
+    # Stable batching: sort by Gmail message ID so batch composition doesn't shift
+    # when a new email arrives between runs (Gmail returns most-recent-first, which
+    # shifts every existing email down by one when something new lands).
+    emails = sorted(filtered_in, key=lambda e: e.get("id", ""))
 
     if not emails:
         return []
 
     results: list[dict] = []
     total_batches = (len(emails) + BATCH_SIZE - 1) // BATCH_SIZE
+    n_passes = len(LLM_PASS_TEMPERATURES)
 
     for b in range(total_batches):
         start = b * BATCH_SIZE
         end = min(start + BATCH_SIZE, len(emails))
         batch = emails[start:end]
-        print(f"  Batch {b+1}/{total_batches} (emails {start+1}-{end})...")
-        try:
-            batch_results = _analyze_batch(batch, offset=start + 1)
-            results.extend(batch_results)
-        except json.JSONDecodeError as e:
-            print(f"  [!] Batch {b+1} parse failed, skipping: {e}")
-        except requests.RequestException as e:
-            print(f"  [!] Batch {b+1} request failed, skipping: {e}")
+        # Union LLM_PASS_TEMPERATURES passes of the same batch. Dedupe by
+        # email_index inside the batch so we don't double-count emails both passes
+        # flagged; results that only one pass produced (the recall win) are kept.
+        batch_combined: list[dict] = []
+        seen_in_batch: set[int] = set()
+        for p, temp in enumerate(LLM_PASS_TEMPERATURES):
+            pass_label = f" pass {p+1}/{n_passes} (t={temp})" if n_passes > 1 else ""
+            print(f"  Batch {b+1}/{total_batches} (emails {start+1}-{end}){pass_label}...")
+            try:
+                pass_results = _analyze_batch(batch, offset=start + 1, temperature=temp)
+            except json.JSONDecodeError as e:
+                print(f"  [!] Batch {b+1}{pass_label} parse failed, skipping: {e}")
+                continue
+            except requests.RequestException as e:
+                print(f"  [!] Batch {b+1}{pass_label} request failed, skipping: {e}")
+                continue
+            for r in pass_results:
+                idx = r.get("email_index")
+                if isinstance(idx, int):
+                    if idx in seen_in_batch:
+                        continue
+                    seen_in_batch.add(idx)
+                batch_combined.append(r)
+        results.extend(batch_combined)
 
     # Build subject lookup for fallback when email_index is missing
     by_subject: dict[str, dict] = {}

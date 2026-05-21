@@ -42,11 +42,13 @@ curl -fsSL https://ollama.com/install.sh | sh
 # Windows: download from https://ollama.com/download
 ```
 
-Pull a model (`qwen2.5:14b` is the recommended default — larger models produce fewer JSON-format errors):
+Pull a model. `qwen3:30b-a3b` is the recommended default — it's a Mixture-of-Experts model (~18 GB resident, ~3 B active per token) so it runs fast on Apple Silicon while reasoning at ~32 B-class quality on the buried-listing aggregator digests this scanner has to handle:
 
 ```bash
-ollama pull qwen2.5:14b
+ollama pull qwen3:30b-a3b
 ```
+
+Smaller alternatives if you have ≤ 16 GB of RAM: `qwen2.5:14b` (~9 GB, the previous default) or `qwen2.5:7b` (~5 GB).
 
 Start the server (if not already running):
 
@@ -90,7 +92,7 @@ Scans unread emails from the last 30 days, classifies them with Ollama, and prin
 |------|-------------|---------|
 | `-k`, `--keyword` | Search keyword (e.g. `"EXFO"` or `"software intern Montreal"`) | (none) |
 | `-d`, `--days` | Days to look back | `30` |
-| `-m`, `--model` | Ollama model name | `qwen2.5:14b` |
+| `-m`, `--model` | Ollama model name | `qwen3:30b-a3b` |
 | `-n`, `--max-emails` | Max emails to fetch per query | `100` |
 | `-o`, `--output` | Export results to a JSON file | (none) |
 | `--all` | Include read emails, not just unread | unread only |
@@ -127,7 +129,7 @@ python scanner.py --debug
 
 ```bash
 OLLAMA_URL=http://localhost:11434   # Ollama server URL
-OLLAMA_MODEL=qwen2.5:14b            # Default model (override with -m)
+OLLAMA_MODEL=qwen3:30b-a3b          # Default model (override with -m)
 ```
 
 ---
@@ -158,7 +160,7 @@ Before hitting the LLM, emails with no internship signal are dropped:
 **Note on `stage`:** The word "stage" in English matches startup funding rounds ("Late Stage", "Early Stage"). The scanner only treats `stage` as an internship signal in the body when French words appear directly before or after it (e.g. `"un stage"`, `"bénévole stage"`, `"stage développeur"`). Subject-line matching is unaffected.
 
 ### 3. LLM classify
-Pre-filtered emails are sent to Ollama in batches of 5. The prompt instructs the model to return only genuine internship/co-op/stage/student positions and to scan aggregator digest bodies (LinkedIn, Glassdoor, Jobright) for buried listings. Results include category, summary, action items, and priority.
+Pre-filtered emails are sorted by Gmail message ID (stable batching — a new arriving email doesn't reshuffle existing batches) and sent to Ollama one at a time. Each batch is sent **twice** and the per-batch results are unioned by email index — this buys recall on borderline cases (buried internships in aggregator digests, in particular) at the cost of more LLM calls. The small batch size keeps each email's body high in the model's attention, which is important for catching internship listings buried mid-digest. The prompt instructs the model to return only genuine internship/co-op/stage/student positions and to scan aggregator digest bodies (LinkedIn, Glassdoor, Jobright) for buried listings. Results include category, summary, action items, and priority.
 
 ### 4. Post-filter
 LLM results are validated:
@@ -211,14 +213,15 @@ python show_bodies.py
 
 | Model | RAM needed | Speed | Quality |
 |-------|-----------|-------|---------|
-| `qwen2.5:14b` | ~10 GB | Medium | Very good (recommended) |
+| `qwen3:30b-a3b` | ~18 GB | Fast (MoE, only 3B active) | Excellent (recommended) |
+| `qwen2.5:14b` | ~10 GB | Medium | Very good |
 | `qwen2.5:7b` | ~5 GB | Fast | Good |
 | `llama3.1:8b` | ~6 GB | Fast | Good |
 | `mistral:7b` | ~5 GB | Fast | Good |
 | `gemma2:9b` | ~7 GB | Fast | Good |
 | `llama3.1:70b` | ~40 GB | Slow | Excellent |
 
-Smaller models (7b/8b) occasionally return malformed JSON or rename expected keys — the scanner tolerates this and skips bad batches, but a 14b+ model gives more consistent results per run.
+Smaller models (7b/8b) occasionally return malformed JSON or rename expected keys — the scanner tolerates this and skips bad batches, but a 14b+ model gives more consistent results per run. The MoE option (`qwen3:30b-a3b`) is the sweet spot on 24 GB Macs: 32 B-class reasoning at roughly 14b-speed.
 
 ---
 
