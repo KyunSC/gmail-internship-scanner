@@ -211,7 +211,8 @@ python show_bodies.py
 
 | Model | RAM needed | Speed | Quality |
 |-------|-----------|-------|---------|
-| `qwen2.5:14b` | ~10 GB | Medium | Very good (recommended) |
+| `qwen3.5:9b` | ~6 GB | Fast | Very good (recommended) |
+| `qwen2.5:14b` | ~10 GB | Medium | Very good |
 | `qwen2.5:7b` | ~5 GB | Fast | Good |
 | `llama3.1:8b` | ~6 GB | Fast | Good |
 | `mistral:7b` | ~5 GB | Fast | Good |
