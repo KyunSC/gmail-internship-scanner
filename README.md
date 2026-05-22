@@ -18,11 +18,12 @@ Gmail (Google servers) --API--> Your machine --Ollama--> Results (local only)
 
 ```
 gmail-internship-scanner/
-├── scanner.py        # Main scanner — Gmail fetch + Ollama LLM analysis
-├── compare.py        # Dev tool: runs both LLM and rule-based filter, diffs results
-├── show_bodies.py    # Dev tool: prints extracted body text for specific emails
-├── credentials.json  # Google OAuth client secret (not committed)
-├── token.json        # Cached OAuth token (not committed)
+├── scanner.py         # Main scanner — Gmail fetch + Ollama LLM analysis
+├── compare.py         # Dev tool: runs both LLM and rule-based filter, diffs results
+├── show_bodies.py     # Dev tool: prints extracted body text for specific emails
+├── credentials.json   # Google OAuth client secret (not committed)
+├── token.json         # Cached OAuth token (not committed)
+├── .last_scan.json    # Last scan snapshot for --from-cache (not committed)
 └── requirements.txt
 ```
 
@@ -97,6 +98,7 @@ Scans unread emails from the last 30 days, classifies them with Ollama, and prin
 | `--debug` | Print raw LLM response for each batch | off |
 | `--clean-inbox` | After scanning, mark non-internship aggregator emails as read (dry run unless `--apply` is also passed) | off |
 | `--apply` | Actually apply the `--clean-inbox` changes | dry run |
+| `--from-cache` | Skip the LLM scan and run `--clean-inbox` against the previous run's cached results (`~1 sec` instead of ~5 min) | off |
 
 ### Examples
 
@@ -118,6 +120,9 @@ python scanner.py --clean-inbox
 
 # Scan and actually mark non-internship emails as read
 python scanner.py --clean-inbox --apply
+
+# Fast cleanup using the previous scan's cached results (~1 sec)
+python scanner.py --clean-inbox --apply --from-cache
 
 # Debug raw LLM responses
 python scanner.py --debug
@@ -143,6 +148,17 @@ OLLAMA_MODEL=qwen3.5:9b             # Default model (override with -m)
 
 This requires the Gmail **modify** scope. On first use with `--clean-inbox`, a new browser authorization prompt will appear.
 
+### Fast cleanup (`--from-cache`)
+
+Every successful scan saves its surfaced email IDs to `.last_scan.json`. Pass `--from-cache` to re-run cleanup against that snapshot without redoing the multi-minute LLM analysis:
+
+```bash
+python scanner.py                                        # full scan, saves cache (slow)
+python scanner.py --clean-inbox --apply --from-cache     # uses cache (~1 second)
+```
+
+Emails that arrived **after** the cached scan are left alone — only the snapshot's analyzed set is eligible for marking. Run a fresh scan periodically (e.g. once a day) to keep the cache up to date.
+
 ---
 
 ## How it works
@@ -158,7 +174,11 @@ Before hitting the LLM, emails with no internship signal are dropped:
 **Note on `stage`:** The word "stage" in English matches startup funding rounds ("Late Stage", "Early Stage"). The scanner only treats `stage` as an internship signal in the body when French words appear directly before or after it (e.g. `"un stage"`, `"bénévole stage"`, `"stage développeur"`). Subject-line matching is unaffected.
 
 ### 3. LLM classify
-Pre-filtered emails are sorted by Gmail message ID (stable batching — a new arriving email doesn't reshuffle existing batches) and sent to Ollama one at a time. Each batch is sent **twice** and the per-batch results are unioned by email index — this buys recall on borderline cases (buried internships in aggregator digests, in particular) at the cost of more LLM calls. The small batch size keeps each email's body high in the model's attention, which is important for catching internship listings buried mid-digest. The prompt instructs the model to return only genuine internship/co-op/stage/student positions and to scan aggregator digest bodies (LinkedIn, Glassdoor, Jobright) for buried listings. Results include category, summary, action items, and priority.
+Pre-filtered emails are sorted by Gmail message ID (stable ordering — a newly arrived email no longer reshuffles existing positions) and sent to Ollama **one email per request, twice each** (`temperature=0` then `temperature=0.5`). The two passes are unioned by email index; results only one pass surfaced are kept. This buys recall on borderline cases — buried internships in aggregator digests, in particular — at the cost of more LLM calls. Sending one email at a time also keeps the body high in the model's attention, which matters for catching listings buried mid-digest.
+
+The Ollama request passes `think: false` so Qwen3-family models route their content into the actual response instead of an empty `<think>` block. The flag is silently ignored by non-Qwen3 models.
+
+The prompt instructs the model to return only genuine internship/co-op/stage/student positions and to scan aggregator digest bodies (LinkedIn, Glassdoor, Jobright) for buried listings. Results include category, summary, action items, and priority.
 
 ### 4. Post-filter
 LLM results are validated:
@@ -229,3 +249,4 @@ Smaller models (7b/8b) occasionally return malformed JSON or rename expected key
 - Email content is fetched from Gmail via Google's official API (HTTPS, OAuth2)
 - All analysis runs locally through Ollama — no data is sent to OpenAI, Anthropic, or any other AI provider
 - `credentials.json` and `token.json` stay on your machine and are already in `.gitignore`
+- `.last_scan.json` (the `--from-cache` snapshot) stores only message IDs, subjects, senders, and dates — no email bodies — and is also gitignored

@@ -27,6 +27,9 @@ SCOPE_MODIFY = "https://www.googleapis.com/auth/gmail.modify"
 
 TOKEN_PATH = Path(__file__).parent / "token.json"
 CREDS_PATH = Path(__file__).parent / "credentials.json"
+# Persisted snapshot of the most recent scan, used by --from-cache so cleanup can
+# skip the multi-minute LLM analysis when nothing material has changed.
+CACHE_PATH = Path(__file__).parent / ".last_scan.json"
 
 # Job-aggregator senders that --clean-inbox may mark as read. LinkedIn entries are
 # restricted to job-alert addresses (so newsletters / personal LinkedIn messages
@@ -41,6 +44,9 @@ CLEAN_INBOX_SENDERS = (
     "noreply@ziprecruiter.com",
     "alert@indeed.com",
     "noreply@indeed.com",
+    # Indeed's job-match subdomain — uses donotreply@match.indeed.com and similar.
+    # Substring matches `from:` so any address under match.indeed.com is caught.
+    "match.indeed.com",
 )
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -341,6 +347,10 @@ Emails:
             "prompt": prompt,
             "stream": False,
             "format": "json",
+            # Qwen3 family routes content into a <think> block by default, leaving
+            # the actual response empty. Disable thinking so the JSON arrives.
+            # Non-Qwen3 models that don't support this field ignore it harmlessly.
+            "think": False,
             "options": {"temperature": temperature, "num_predict": 4096},
         },
         timeout=180,
@@ -626,6 +636,7 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
         r["from"] = original.get("from", "")
         r["subject"] = original.get("subject", "")
         r["date"] = original.get("date", "")
+        r["id"] = original.get("id", "")
 
         # Validate company against the email — null it out if the LLM hallucinated.
         company = r.get("company")
@@ -758,15 +769,51 @@ def export_json(results: list[dict], path: str):
     print(f"  Exported {len(results)} results to {path}")
 
 
+# ── Scan cache ──────────────────────────────────────────────────────────────
+
+def save_scan_cache(emails: list[dict], results: list[dict]):
+    """Persist enough of the most recent scan that --from-cache can re-run the
+    cleanup without redoing the LLM analysis. We only store header-level fields
+    (no bodies) to keep the file small and avoid leaking content on disk."""
+    emails_min = [
+        {"id": e.get("id", ""), "subject": e.get("subject", ""),
+         "from": e.get("from", ""), "date": e.get("date", "")}
+        for e in emails if e.get("id")
+    ]
+    kept_ids = [r.get("id") for r in results if r.get("id")]
+    payload = {
+        "scan_time": datetime.now().isoformat(timespec="seconds"),
+        "emails": emails_min,
+        "kept_ids": kept_ids,
+    }
+    CACHE_PATH.write_text(json.dumps(payload))
+
+
+def load_scan_cache() -> dict | None:
+    if not CACHE_PATH.exists():
+        return None
+    try:
+        return json.loads(CACHE_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 # ── Inbox cleanup ───────────────────────────────────────────────────────────
 
-def clean_inbox(service, results: list[dict], days: int = 30, apply: bool = False,
-                email_cache: dict | None = None):
+def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
+                apply: bool = False, email_cache: dict | None = None,
+                keep_ids: set[str] | None = None,
+                scanned_ids: set[str] | None = None):
     """Mark unread emails from job-aggregator senders as read IF they're not in
     the scanner's results. Aggregator emails the scanner surfaced stay unread.
 
     email_cache: optional dict mapping message-id -> email dict (from run_gmail_search),
     used to skip individual metadata API calls for already-fetched emails.
+
+    keep_ids/scanned_ids: when provided (--from-cache path), match by message ID
+    rather than the (sender, date) tuple derived from `results`. Candidates not
+    in scanned_ids are left untouched so emails that arrived after the cached
+    scan aren't marked read without analysis.
     """
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
     sender_clauses = " OR ".join(f"from:{s}" for s in CLEAN_INBOX_SENDERS)
@@ -788,20 +835,30 @@ def clean_inbox(service, results: list[dict], days: int = 30, apply: bool = Fals
         if not page_token:
             break
 
-    # Keep-set: scanner's surfaced results, keyed by (from, date)
-    keep_keys = set()
-    for r in results:
-        sender = (r.get("from") or "").strip().lower()
-        date = (r.get("date") or "").strip()
-        if sender and date:
-            keep_keys.add((sender, date))
+    using_ids = keep_ids is not None
+    # Keep-set: scanner's surfaced results. From-cache path matches by ID;
+    # in-process path falls back to (sender, date) because the result dicts
+    # passed through display logic may not carry IDs.
+    keep_keys: set[tuple[str, str]] = set()
+    if not using_ids:
+        for r in results or []:
+            sender = (r.get("from") or "").strip().lower()
+            date = (r.get("date") or "").strip()
+            if sender and date:
+                keep_keys.add((sender, date))
 
     to_mark: list[dict] = []
     kept_count = 0
     kept_subject_safety = 0
+    kept_new_arrival = 0
     cache_hits = 0
     for meta in candidates:
         msg_id = meta["id"]
+        # From-cache path: candidates not in the cached scan are left alone — we
+        # don't know whether they're internships without re-analyzing.
+        if using_ids and scanned_ids is not None and msg_id not in scanned_ids:
+            kept_new_arrival += 1
+            continue
         if msg_id in cache:
             cached = cache[msg_id]
             sender_raw = cached.get("from", "")
@@ -818,7 +875,11 @@ def clean_inbox(service, results: list[dict], days: int = 30, apply: bool = Fals
             date_raw = headers.get("Date", "")
             subject = headers.get("Subject", "(no subject)")
 
-        if (sender_raw.strip().lower(), date_raw.strip()) in keep_keys:
+        if using_ids:
+            in_keep = msg_id in keep_ids
+        else:
+            in_keep = (sender_raw.strip().lower(), date_raw.strip()) in keep_keys
+        if in_keep:
             kept_count += 1
             continue
         # Safety net: keep unread if subject mentions an internship keyword. Covers
@@ -829,18 +890,19 @@ def clean_inbox(service, results: list[dict], days: int = 30, apply: bool = Fals
         to_mark.append({"id": meta["id"], "from": sender_raw, "subject": subject, "date": date_raw})
 
     cache_note = f", {cache_hits} from cache" if cache_hits else ""
+    new_arrival_note = (
+        f" + {kept_new_arrival} (arrived after cached scan)" if kept_new_arrival else ""
+    )
     print(f"  Found {len(candidates)} unread aggregator email(s){cache_note}; keeping {kept_count} (scanner-surfaced) "
-          f"+ {kept_subject_safety} (subject mentions internship); {len(to_mark)} to mark as read.\n")
+          f"+ {kept_subject_safety} (subject mentions internship){new_arrival_note}; {len(to_mark)} to mark as read.\n")
 
     if not to_mark:
         print("  Nothing to mark.\n")
         return
 
-    for m in to_mark[:30]:
+    for m in to_mark:
         print(f"  • {m['subject'][:70]}")
         print(f"      {DIM}from {m['from']}  ·  {m['date']}{RESET}")
-    if len(to_mark) > 30:
-        print(f"  …and {len(to_mark) - 30} more")
 
     if not apply:
         print(f"\n  {DIM}(Dry run — re-run with --apply to mark these {len(to_mark)} emails as read){RESET}\n")
@@ -910,6 +972,12 @@ def main():
         action="store_true",
         help="With --clean-inbox, actually mark the emails as read (otherwise dry-run only).",
     )
+    parser.add_argument(
+        "--from-cache",
+        action="store_true",
+        help="Skip the LLM scan and run --clean-inbox against the cached scan results "
+             "from the previous run. ~1 second vs ~5 minutes. Requires --clean-inbox.",
+    )
     args = parser.parse_args()
 
     if args.model:
@@ -918,6 +986,28 @@ def main():
 
     print(f"\n{BOLD}Internship Scanner{RESET}")
     print(f"{DIM}Local analysis with {OLLAMA_MODEL} via Ollama{RESET}\n")
+
+    # --from-cache short-circuit: skip Ollama + Gmail search entirely and just
+    # run the cleanup against the persisted scan from the previous run.
+    if args.from_cache:
+        if not args.clean_inbox:
+            print("[!] --from-cache requires --clean-inbox.")
+            sys.exit(1)
+        cached = load_scan_cache()
+        if cached is None:
+            print(f"[!] No scan cache at {CACHE_PATH.name}. Run scanner.py without --from-cache first.")
+            sys.exit(1)
+        print(f"Using cached scan from {cached.get('scan_time', '?')}")
+        print("Connecting to Gmail...")
+        service = get_gmail_service(write_access=True)
+        email_cache = {e["id"]: e for e in cached.get("emails", []) if e.get("id")}
+        scanned_ids = set(email_cache.keys())
+        keep_ids = set(cached.get("kept_ids", []))
+        clean_inbox(
+            service, days=args.days, apply=args.apply, email_cache=email_cache,
+            keep_ids=keep_ids, scanned_ids=scanned_ids,
+        )
+        return
 
     # Check Ollama
     print("[1/3] Checking Ollama...")
@@ -948,6 +1038,10 @@ def main():
 
     # Display
     display_results(results)
+
+    # Save cache so --from-cache can run a near-instant cleanup later without
+    # redoing the LLM analysis.
+    save_scan_cache(emails, results)
 
     # Export
     if args.output:
