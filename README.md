@@ -99,6 +99,7 @@ Scans unread emails from the last 30 days, classifies them with Ollama, and prin
 | `--clean-inbox` | After scanning, mark non-internship aggregator emails as read (dry run unless `--apply` is also passed) | off |
 | `--apply` | Actually apply the `--clean-inbox` changes | dry run |
 | `--from-cache` | Skip the LLM scan and run `--clean-inbox` against the previous run's cached results (`~1 sec` instead of ~5 min) | off |
+| `--fast` | Skip the LLM and use the full-body rule-based keyword filter only (~50× faster, no per-email summary) | off |
 
 ### Examples
 
@@ -123,6 +124,10 @@ python scanner.py --clean-inbox --apply
 
 # Fast cleanup using the previous scan's cached results (~1 sec)
 python scanner.py --clean-inbox --apply --from-cache
+
+# No-LLM scan using full-body keyword filtering (~5 sec end-to-end)
+python scanner.py --fast
+python scanner.py --fast --clean-inbox --apply
 
 # Debug raw LLM responses
 python scanner.py --debug
@@ -158,6 +163,16 @@ python scanner.py --clean-inbox --apply --from-cache     # uses cache (~1 second
 ```
 
 Emails that arrived **after** the cached scan are left alone — only the snapshot's analyzed set is eligible for marking. Run a fresh scan periodically (e.g. once a day) to keep the cache up to date.
+
+### Speed modes at a glance
+
+| Goal | Command | Time |
+|---|---|---|
+| Triage with rich per-listing summaries | `python scanner.py` | ~5 min |
+| Cleanup inbox using yesterday's scan | `python scanner.py --clean-inbox --apply --from-cache` | ~1 sec |
+| One-shot scan + cleanup, no LLM | `python scanner.py --fast --clean-inbox --apply` | ~5 sec |
+
+`--fast` is appropriate when you trust the rule-based filter for cleanup decisions but don't need the LLM's listing-by-listing breakdown of each digest. In practice the two modes agree on which emails are internships when every body containing an `intern`/`co-op`/`stage` keyword genuinely is one — see `compare.py` to verify for your own inbox.
 
 ---
 

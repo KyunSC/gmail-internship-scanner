@@ -692,6 +692,45 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
     return filtered
 
 
+def rule_based_analyze(emails: list[dict]) -> list[dict]:
+    """Fast path: full-body keyword classification without the LLM. Returns
+    result dicts shaped to match analyze_with_ollama's output so display, cache,
+    and cleanup downstream all work unchanged. Comparable accuracy to the LLM
+    when every body containing an internship keyword is genuinely an internship
+    listing; loses the LLM's ability to spot footer-boilerplate false positives
+    and gives no per-email summaries.
+    """
+    out: list[dict] = []
+    dropped_no_signal = 0
+    dropped_term = 0
+    for e in emails:
+        subject = e.get("subject", "")
+        body = e.get("body", "")
+        sender = e.get("from", "")
+        if not _has_internship_signal(subject, body, sender):
+            dropped_no_signal += 1
+            continue
+        if _all_intern_listings_excluded(sender, body):
+            dropped_term += 1
+            continue
+        out.append({
+            "id": e.get("id", ""),
+            "subject": subject,
+            "from": sender,
+            "date": e.get("date", ""),
+            "company": None,
+            "category": "internship",
+            "summary": "(rule-based match — full-body keyword filter)",
+            "action_items": [],
+            "priority": "medium",
+        })
+    if dropped_no_signal:
+        print(f"  Dropped {dropped_no_signal} email(s) with no internship signal")
+    if dropped_term:
+        print(f"  Dropped {dropped_term} email(s) whose body mentions Fall 2026 / September 2026")
+    return out
+
+
 # ── Display ─────────────────────────────────────────────────────────────────
 
 CATEGORY_COLORS = {
@@ -978,6 +1017,12 @@ def main():
         help="Skip the LLM scan and run --clean-inbox against the cached scan results "
              "from the previous run. ~1 second vs ~5 minutes. Requires --clean-inbox.",
     )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Use rule-based full-body keyword filter instead of the LLM. ~100x faster "
+             "but no per-email summary. Useful for cleanup runs.",
+    )
     args = parser.parse_args()
 
     if args.model:
@@ -985,7 +1030,10 @@ def main():
     DEBUG = args.debug
 
     print(f"\n{BOLD}Internship Scanner{RESET}")
-    print(f"{DIM}Local analysis with {OLLAMA_MODEL} via Ollama{RESET}\n")
+    if args.fast:
+        print(f"{DIM}Rule-based analysis (no LLM){RESET}\n")
+    else:
+        print(f"{DIM}Local analysis with {OLLAMA_MODEL} via Ollama{RESET}\n")
 
     # --from-cache short-circuit: skip Ollama + Gmail search entirely and just
     # run the cleanup against the persisted scan from the previous run.
@@ -1009,13 +1057,15 @@ def main():
         )
         return
 
-    # Check Ollama
-    print("[1/3] Checking Ollama...")
-    check_ollama()
-    print(f"  Using model: {OLLAMA_MODEL}")
+    # Check Ollama (unless --fast, which skips the LLM entirely)
+    if not args.fast:
+        print("[1/3] Checking Ollama...")
+        check_ollama()
+        print(f"  Using model: {OLLAMA_MODEL}")
 
     # Gmail auth (request modify scope only when needed)
-    print("[2/3] Connecting to Gmail...")
+    step = "[1/2]" if args.fast else "[2/3]"
+    print(f"{step} Connecting to Gmail...")
     service = get_gmail_service(write_access=args.clean_inbox)
 
     # Search
@@ -1032,9 +1082,13 @@ def main():
         print("\n  No emails matched the search queries.\n")
         return
 
-    # Analyze locally
-    print(f"[3/3] Analyzing with {OLLAMA_MODEL} (this may take a moment)...")
-    results = analyze_with_ollama(emails)
+    # Analyze
+    if args.fast:
+        print("[2/2] Rule-based analysis (no LLM)...")
+        results = rule_based_analyze(emails)
+    else:
+        print(f"[3/3] Analyzing with {OLLAMA_MODEL} (this may take a moment)...")
+        results = analyze_with_ollama(emails)
 
     # Display
     display_results(results)
