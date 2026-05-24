@@ -162,7 +162,7 @@ python scanner.py                                        # full scan, saves cach
 python scanner.py --clean-inbox --apply --from-cache     # uses cache (~1 second)
 ```
 
-Emails that arrived **after** the cached scan are left alone — only the snapshot's analyzed set is eligible for marking. Run a fresh scan periodically (e.g. once a day) to keep the cache up to date.
+Emails that arrived **after** the cached scan are evaluated against the standard rules (subject safety net + scanner-surfaced set). They get marked read if their subject doesn't mention an internship keyword and they weren't in the cached scan's surfaced set. The risk this leaves on the table: a buried internship in a new digest whose subject doesn't mention `intern`/`co-op`/`stage`. Run a fresh `python scanner.py` periodically (e.g. once a day) to catch those.
 
 ### Speed modes at a glance
 

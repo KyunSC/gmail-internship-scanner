@@ -841,18 +841,18 @@ def load_scan_cache() -> dict | None:
 
 def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
                 apply: bool = False, email_cache: dict | None = None,
-                keep_ids: set[str] | None = None,
-                scanned_ids: set[str] | None = None):
+                keep_ids: set[str] | None = None):
     """Mark unread emails from job-aggregator senders as read IF they're not in
     the scanner's results. Aggregator emails the scanner surfaced stay unread.
 
     email_cache: optional dict mapping message-id -> email dict (from run_gmail_search),
     used to skip individual metadata API calls for already-fetched emails.
 
-    keep_ids/scanned_ids: when provided (--from-cache path), match by message ID
-    rather than the (sender, date) tuple derived from `results`. Candidates not
-    in scanned_ids are left untouched so emails that arrived after the cached
-    scan aren't marked read without analysis.
+    keep_ids: when provided (--from-cache path), match the keep set by message ID
+    rather than the (sender, date) tuple derived from `results`. New arrivals
+    not in the cache are still processed by the standard rules (surfaced /
+    subject safety net) because the query already restricts to known aggregator
+    senders.
     """
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
     sender_clauses = " OR ".join(f"from:{s}" for s in CLEAN_INBOX_SENDERS)
@@ -889,15 +889,15 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
     to_mark: list[dict] = []
     kept_count = 0
     kept_subject_safety = 0
-    kept_new_arrival = 0
     cache_hits = 0
     for meta in candidates:
         msg_id = meta["id"]
-        # From-cache path: candidates not in the cached scan are left alone — we
-        # don't know whether they're internships without re-analyzing.
-        if using_ids and scanned_ids is not None and msg_id not in scanned_ids:
-            kept_new_arrival += 1
-            continue
+        # All candidates here are from known aggregator senders (the query
+        # restricts to CLEAN_INBOX_SENDERS), so we trust the standard "surfaced
+        # + subject safety net" rules even for new arrivals that weren't in the
+        # cached scan. The risk — a buried internship in a new digest with no
+        # intern keyword in the subject — only matters when --from-cache is
+        # used, and that path explicitly trades freshness for speed.
         if msg_id in cache:
             cached = cache[msg_id]
             sender_raw = cached.get("from", "")
@@ -929,11 +929,8 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
         to_mark.append({"id": meta["id"], "from": sender_raw, "subject": subject, "date": date_raw})
 
     cache_note = f", {cache_hits} from cache" if cache_hits else ""
-    new_arrival_note = (
-        f" + {kept_new_arrival} (arrived after cached scan)" if kept_new_arrival else ""
-    )
     print(f"  Found {len(candidates)} unread aggregator email(s){cache_note}; keeping {kept_count} (scanner-surfaced) "
-          f"+ {kept_subject_safety} (subject mentions internship){new_arrival_note}; {len(to_mark)} to mark as read.\n")
+          f"+ {kept_subject_safety} (subject mentions internship); {len(to_mark)} to mark as read.\n")
 
     if not to_mark:
         print("  Nothing to mark.\n")
@@ -1049,11 +1046,10 @@ def main():
         print("Connecting to Gmail...")
         service = get_gmail_service(write_access=True)
         email_cache = {e["id"]: e for e in cached.get("emails", []) if e.get("id")}
-        scanned_ids = set(email_cache.keys())
         keep_ids = set(cached.get("kept_ids", []))
         clean_inbox(
             service, days=args.days, apply=args.apply, email_cache=email_cache,
-            keep_ids=keep_ids, scanned_ids=scanned_ids,
+            keep_ids=keep_ids,
         )
         return
 
