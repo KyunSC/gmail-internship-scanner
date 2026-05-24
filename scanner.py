@@ -40,13 +40,16 @@ CLEAN_INBOX_SENDERS = (
     "jobs-noreply@linkedin.com",
     "noreply@glassdoor.com",
     "noreply@jobright.ai",
-    "alerts@ziprecruiter.com",
-    "noreply@ziprecruiter.com",
     "alert@indeed.com",
     "noreply@indeed.com",
     # Indeed's job-match subdomain — uses donotreply@match.indeed.com and similar.
     # Substring matches `from:` so any address under match.indeed.com is caught.
     "match.indeed.com",
+    # ZipRecruiter uses many automated personas (alerts@, noreply@, phil@, etc.).
+    # Domain match catches all of them, including future ones. Real recruiter
+    # outreach via seekerteam@ziprecruiter.com is also caught — the subject
+    # safety net keeps any internship-mentioning ones unread regardless.
+    "ziprecruiter.com",
 )
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
