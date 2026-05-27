@@ -179,7 +179,7 @@ Emails that arrived **after** the cached scan are evaluated against the standard
 ## How it works
 
 ### 1. Fetch
-Runs several targeted Gmail queries (internship/co-op/stage keywords, application/interview subjects, recruiter senders) and deduplicates by message ID. Full bodies are extracted from MIME parts, HTML is stripped, URLs are removed, and text is truncated to 5000 chars.
+Runs several targeted Gmail queries (internship/co-op/stage keywords, application/interview subjects, recruiter senders) and deduplicates by message ID. Full bodies are extracted from MIME parts and truncated to 5000 chars. Both `text/plain` and `text/html` versions are normalized (HTML stripped, URLs removed, whitespace collapsed) and the longer of the two is kept — LinkedIn job alerts in particular ship a `text/plain` part that's just footer boilerplate, with the actual listings only in `text/html`.
 
 ### 2. Pre-filter (rule-based)
 Before hitting the LLM, emails with no internship signal are dropped:
@@ -212,7 +212,7 @@ Results are sorted by priority and color-coded by category: `INTERNSHIP` (green)
 
 ### `compare.py` — LLM vs rule-based comparison
 
-Fetches emails once, runs both the rule-based keyword filter and the full LLM pipeline on the same set, then diffs the results.
+Fetches emails once, runs both the pure rule-based full-body parser and the full LLM scanner pipeline on the same set, then diffs the results.
 
 ```bash
 python compare.py              # last 30 days, unread only
@@ -221,12 +221,14 @@ python compare.py --all        # include read emails
 ```
 
 Output sections:
-- **RULE-BASED** — emails kept by pure keyword matching (no LLM)
+- **RULE-BASED** — emails kept by pure keyword matching on the full body (no LLM)
 - **DROPPED** — emails the rule filter excluded, with the reason (e.g. "all listings are Fall 2026")
-- **LLM-BASED** — emails the LLM surfaced after full analysis
+- **LLM-BASED** — emails the LLM scanner surfaced after full analysis
 - **DIFF SUMMARY** — which emails each approach caught that the other missed
 
 Use this to tune the prompt, adjust keyword rules, or verify that a code change doesn't cause regressions.
+
+> **Don't run this alongside `python scanner.py`.** Both invoke Ollama, and the two processes will contend for VRAM (each spawned generate request gets its own KV cache slot reserved server-side). Run them sequentially.
 
 **Key finding from initial comparison:** The LLM correctly drops Glassdoor digest emails where `intern` appears only in the footer boilerplate (`"Create job alerts for related roles: software intern"`), while the rule-based filter cannot distinguish these from real listings. The LLM is the meaningful filter for aggregator digest noise.
 

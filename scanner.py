@@ -128,8 +128,23 @@ def _html_to_text(html: str) -> str:
     return " ".join(p.parts)
 
 
+def _normalize_body(text: str) -> str:
+    text = html.unescape(text)
+    text = re.sub("[​-‏‪-‮⁠﻿]", "", text)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\s+", " ", text)
+    # Collapse runs of any single non-alphanumeric char (decorative separators like ===, ---, ***)
+    text = re.sub(r"([^\w\s])\1{3,}", r"\1\1\1", text)
+    return text.strip()
+
+
 def _extract_body(payload: dict) -> str:
-    """Walk MIME parts and return the cleanest text body we can find."""
+    """Walk MIME parts and return the cleanest text body we can find.
+
+    Some senders (notably LinkedIn) ship a text/plain part that, after URL
+    stripping, is just footer boilerplate while the actual job listings live
+    only in text/html. So we extract both and return whichever yields more
+    substantive text after cleanup."""
     plain_parts: list[str] = []
     html_parts: list[str] = []
 
@@ -151,20 +166,10 @@ def _extract_body(payload: dict) -> str:
 
     walk(payload)
 
-    if plain_parts:
-        text = "\n".join(plain_parts)
-    elif html_parts:
-        text = _html_to_text("\n".join(html_parts))
-    else:
-        return ""
+    plain_text = _normalize_body("\n".join(plain_parts)) if plain_parts else ""
+    html_text = _normalize_body(_html_to_text("\n".join(html_parts))) if html_parts else ""
 
-    text = html.unescape(text)
-    text = re.sub("[​-‏‪-‮⁠﻿]", "", text)
-    text = re.sub(r"https?://\S+", "", text)
-    text = re.sub(r"\s+", " ", text)
-    # Collapse runs of any single non-alphanumeric char (decorative separators like ===, ---, ***)
-    text = re.sub(r"([^\w\s])\1{3,}", r"\1\1\1", text)
-    return text.strip()
+    return html_text if len(html_text) > len(plain_text) else plain_text
 
 
 BODY_MAX_CHARS = 5000  # truncate to keep prompts manageable and skip footers
@@ -263,6 +268,20 @@ def check_ollama():
         sys.exit(1)
 
 
+def _estimate_ctx_size(prompt: str, num_predict: int) -> int:
+    """Pick the smallest power-of-2 num_ctx that fits this request, with a floor
+    of 2048. Token count is estimated at ~3 chars/token (conservative for BPE).
+    Bucketing to powers of 2 keeps Ollama from reloading the model between
+    similar-sized requests — a reload only happens when the bucket changes.
+    KV cache scales linearly with num_ctx, so a 4096-bucket request uses half
+    the VRAM of an 8192-bucket request."""
+    needed = len(prompt) // 3 + num_predict + 256  # 256 = safety margin
+    bucket = 2048
+    while bucket < needed:
+        bucket *= 2
+    return bucket
+
+
 def _analyze_batch(emails: list[dict], offset: int, temperature: float = 0.0) -> list[dict]:
     """Analyze a single batch of emails. offset is the 1-based index of emails[0].
 
@@ -354,7 +373,11 @@ Emails:
             # the actual response empty. Disable thinking so the JSON arrives.
             # Non-Qwen3 models that don't support this field ignore it harmlessly.
             "think": False,
-            "options": {"temperature": temperature, "num_predict": 4096},
+            "options": {
+                "temperature": temperature,
+                "num_predict": 4096,
+                "num_ctx": _estimate_ctx_size(prompt, 4096),
+            },
         },
         timeout=180,
     )
