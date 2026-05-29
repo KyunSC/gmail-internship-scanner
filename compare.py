@@ -15,6 +15,7 @@ from scanner import (
     _all_intern_listings_excluded,
     _has_internship_signal,
     analyze_with_ollama,
+    clean_inbox,
     get_gmail_service,
     run_gmail_search,
 )
@@ -53,11 +54,17 @@ def main():
     parser.add_argument("-d", "--days", type=int, default=30)
     parser.add_argument("-n", "--max-emails", type=int, default=100)
     parser.add_argument("--all", action="store_true", help="Include read emails")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Mark aggregator emails as read when BOTH pipelines agree they're "
+             "not internships. Dry-run unless this flag is given.",
+    )
     args = parser.parse_args()
 
     print(f"\n{BOLD}Scanner Comparison: LLM vs rule-based{RESET}\n")
 
-    service = get_gmail_service()
+    service = get_gmail_service(write_access=args.apply)
     print(f"Fetching emails (last {args.days} days, {'all' if args.all else 'unread only'})…")
     emails = run_gmail_search(
         service, days=args.days, unread_only=not args.all, max_results=args.max_emails
@@ -117,6 +124,18 @@ def main():
             print(f"      {DIM}{r.get('from','')} | {r.get('category','')} | {r.get('summary','')[:80]}{RESET}")
 
     print(f"\n{BOLD}{'='*70}{RESET}\n")
+
+    # ── Cleanup ─────────────────────────────────────────────────────────────
+    # Mark aggregator emails as read when BOTH pipelines agreed they're not
+    # internships. Keep set = union of what either pipeline surfaced (any
+    # disagreement is treated as "keep unread" — safety bias). Emails outside
+    # the fetched set still pass through clean_inbox's normal subject safety net.
+    keep_ids = rule_ids | llm_ids
+    email_cache = {e["id"]: e for e in emails if e.get("id")}
+    clean_inbox(
+        service, days=args.days, apply=args.apply,
+        email_cache=email_cache, keep_ids=keep_ids,
+    )
 
 
 if __name__ == "__main__":

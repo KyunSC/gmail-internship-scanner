@@ -387,7 +387,20 @@ Emails:
         print(f"\n  ----- RAW LLM RESPONSE (emails {offset}-{offset + len(emails) - 1}) -----")
         print(f"  {raw}")
         print(f"  ----- END RAW -----\n")
-    parsed = json.loads(raw)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        from pathlib import Path as _P
+        dump = _P("/tmp/scanner_bad_response.txt")
+        with dump.open("a") as f:
+            f.write(f"\n===== BAD RESPONSE batch offset={offset} t={temperature} =====\n")
+            f.write(f"--- email subjects in batch ---\n")
+            for i, e in enumerate(emails):
+                f.write(f"  [{offset + i}] {e.get('subject','')!r}\n")
+            f.write(f"--- raw response ({len(raw)} chars) ---\n")
+            f.write(raw)
+            f.write("\n===== END =====\n")
+        raise
     items = _extract_results_array(parsed)
     # Normalize field names that the model sometimes invents
     return [_normalize_result(item) for item in items]
