@@ -282,22 +282,19 @@ def _estimate_ctx_size(prompt: str, num_predict: int) -> int:
     return bucket
 
 
-def _analyze_batch(emails: list[dict], offset: int, temperature: float = 0.0) -> list[dict]:
-    """Analyze a single batch of emails. offset is the 1-based index of emails[0].
+_PROMPT_QUOTE_FIXES = str.maketrans({
+    "“": '"', "”": '"', "‘": "'", "’": "'",
+})
 
-    temperature=0 is the deterministic baseline. Non-zero gives sampling diversity,
-    used by the 2nd LLM pass to surface borderline emails the deterministic pass
-    missed (e.g. buried internships in aggregator digests).
-    """
-    email_text = ""
-    for i, e in enumerate(emails):
-        email_text += f"\n--- Email {offset + i} ---\n"
-        email_text += f"Subject: {e['subject']}\n"
-        email_text += f"From: {e['from']}\n"
-        email_text += f"Date: {e['date']}\n"
-        email_text += f"Body: {e.get('body', '')}\n"
 
-    prompt = f"""You are analyzing a student's inbox for internship and job-related emails.
+def _sanitize_for_prompt(s: str) -> str:
+    # Qwen3.5 emits ASCII " in place of curly " inside JSON strings, which
+    # closes the string early and breaks the response. Normalize the lookalikes
+    # before they reach the model.
+    return s.translate(_PROMPT_QUOTE_FIXES) if s else s
+
+
+PROMPT_DEFAULT = """You are analyzing a student's inbox for internship and job-related emails.
 
 CLASSIFICATION PRIORITY:
 - Combine signals from the SUBJECT, BODY, and SENDER. No single field is decisive on
@@ -362,6 +359,62 @@ If NO emails in this batch are relevant, return: {{"results": []}}
 Emails:
 {email_text}"""
 
+
+PROMPT_TIGHT = """Classify emails for a student's internship search. For each email decide whether \
+it relates to an internship / co-op / stage / stagiaire / student role — the listing itself, \
+recruiter outreach, application confirmations, status updates, or interview messages.
+
+INCLUDE only if at least one applies:
+- Subject contains intern, internship, stage, stagiaire, co-op, coop, or student
+- Body clearly describes a student / intern / co-op position
+- Recruiter or career-address message about an internship application
+For digest emails (LinkedIn, Glassdoor, Jobright), scan the FULL body — include if ANY \
+listing is an internship, even if buried in recommendations.
+
+EXCLUDE: full-time roles ("junior", "senior", "mid-level", "lead", "associate", "engineer", \
+"developer", "analyst", "specialist") when not explicitly labeled as an internship; \
+newsletters; promos; Quora digests.
+
+Return ONLY this JSON, fields verbatim:
+{{"results": [{{"email_index": <int from the block>, "subject": "<verbatim>", \
+"from": "<verbatim>", "date": "<verbatim>", \
+"company": "<from THIS email's body, or null>", \
+"category": "internship|recruiter|confirmation|reply|status", \
+"summary": "<this email only>", "action_items": ["..."], \
+"priority": "high|medium|low"}}]}}
+
+Each result must reflect its own email — do not mix content across the batch. \
+Do not rename "results" or "subject". If nothing matches, return {{"results": []}}.
+
+Emails:
+{email_text}"""
+
+
+def _analyze_batch(
+    emails: list[dict],
+    offset: int,
+    temperature: float = 0.0,
+    prompt_template: str = PROMPT_DEFAULT,
+) -> list[dict]:
+    """Analyze a single batch of emails. offset is the 1-based index of emails[0].
+
+    temperature=0 is the deterministic baseline. Non-zero gives sampling diversity,
+    used by the 2nd LLM pass to surface borderline emails the deterministic pass
+    missed (e.g. buried internships in aggregator digests).
+
+    prompt_template must contain the literal "{email_text}" placeholder. Swap it
+    to A/B different prompt phrasings against the same email set.
+    """
+    email_text = ""
+    for i, e in enumerate(emails):
+        email_text += f"\n--- Email {offset + i} ---\n"
+        email_text += f"Subject: {_sanitize_for_prompt(e['subject'])}\n"
+        email_text += f"From: {_sanitize_for_prompt(e['from'])}\n"
+        email_text += f"Date: {e['date']}\n"
+        email_text += f"Body: {_sanitize_for_prompt(e.get('body', ''))}\n"
+
+    prompt = prompt_template.format(email_text=email_text)
+
     r = requests.post(
         f"{OLLAMA_URL}/api/generate",
         json={
@@ -387,20 +440,7 @@ Emails:
         print(f"\n  ----- RAW LLM RESPONSE (emails {offset}-{offset + len(emails) - 1}) -----")
         print(f"  {raw}")
         print(f"  ----- END RAW -----\n")
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        from pathlib import Path as _P
-        dump = _P("/tmp/scanner_bad_response.txt")
-        with dump.open("a") as f:
-            f.write(f"\n===== BAD RESPONSE batch offset={offset} t={temperature} =====\n")
-            f.write(f"--- email subjects in batch ---\n")
-            for i, e in enumerate(emails):
-                f.write(f"  [{offset + i}] {e.get('subject','')!r}\n")
-            f.write(f"--- raw response ({len(raw)} chars) ---\n")
-            f.write(raw)
-            f.write("\n===== END =====\n")
-        raise
+    parsed = json.loads(raw)
     items = _extract_results_array(parsed)
     # Normalize field names that the model sometimes invents
     return [_normalize_result(item) for item in items]
@@ -580,7 +620,10 @@ BATCH_SIZE = 1
 LLM_PASS_TEMPERATURES = (0.0, 0.5)
 
 
-def analyze_with_ollama(emails: list[dict]) -> list[dict]:
+def analyze_with_ollama(
+    emails: list[dict],
+    prompt_template: str = PROMPT_DEFAULT,
+) -> list[dict]:
     """Send email metadata to Ollama for classification and summarization in batches."""
     if not emails:
         return []
@@ -619,7 +662,10 @@ def analyze_with_ollama(emails: list[dict]) -> list[dict]:
             pass_label = f" pass {p+1}/{n_passes} (t={temp})" if n_passes > 1 else ""
             print(f"  Batch {b+1}/{total_batches} (emails {start+1}-{end}){pass_label}...")
             try:
-                pass_results = _analyze_batch(batch, offset=start + 1, temperature=temp)
+                pass_results = _analyze_batch(
+                    batch, offset=start + 1, temperature=temp,
+                    prompt_template=prompt_template,
+                )
             except json.JSONDecodeError as e:
                 print(f"  [!] Batch {b+1}{pass_label} parse failed, skipping: {e}")
                 continue

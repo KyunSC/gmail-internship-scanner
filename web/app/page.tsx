@@ -58,9 +58,15 @@ export default function Dashboard() {
   const [cleanFromCache, setCleanFromCache] = useState(true);
   const [cleanApply, setCleanApply] = useState(false);
 
+  // Compare controls
+  const [compareDays, setCompareDays] = useState(30);
+  const [compareMaxEmails, setCompareMaxEmails] = useState(100);
+  const [compareAll, setCompareAll] = useState(false);
+  const [compareApply, setCompareApply] = useState(false);
+
   // Stream state
   const [log, setLog] = useState("");
-  const [busy, setBusy] = useState<null | "scan" | "clean">(null);
+  const [busy, setBusy] = useState<null | "scan" | "clean" | "compare">(null);
   const abortRef = useRef<AbortController | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
@@ -89,7 +95,7 @@ export default function Dashboard() {
 
   const runStream = useCallback(
     async (
-      kind: "scan" | "clean",
+      kind: "scan" | "clean" | "compare",
       url: string,
       body: Record<string, unknown>,
     ) => {
@@ -141,6 +147,14 @@ export default function Dashboard() {
       days,
       apply: cleanApply,
       fromCache: cleanFromCache,
+    });
+
+  const onCompare = () =>
+    runStream("compare", "/api/compare", {
+      days: compareDays,
+      maxEmails: compareMaxEmails,
+      all: compareAll,
+      apply: compareApply,
     });
 
   const onCancel = () => abortRef.current?.abort();
@@ -269,6 +283,66 @@ export default function Dashboard() {
                   : "Dry-run cleanup"}
             </button>
             {busy === "clean" && (
+              <button onClick={onCancel} className="btn-ghost">
+                Cancel
+              </button>
+            )}
+          </div>
+        </Panel>
+      </section>
+
+      <section className="mb-6">
+        <Panel title="Compare LLM vs rule-based">
+          <p className="text-xs text-[color:var(--color-muted)] mb-3">
+            Runs <code>compare.py</code>: fetches emails once, runs both the LLM
+            scanner and the pure rule-based filter on the same set, and prints
+            the diff. Diagnostic tool for tuning the prompt or verifying changes.
+            Apply marks aggregator emails as read only when both pipelines agree
+            they&apos;re not internships.
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Days back">
+              <input
+                type="number"
+                min={1}
+                value={compareDays}
+                onChange={(e) => setCompareDays(Number(e.target.value) || 1)}
+                className="input"
+              />
+            </Field>
+            <Field label="Max emails">
+              <input
+                type="number"
+                min={1}
+                value={compareMaxEmails}
+                onChange={(e) => setCompareMaxEmails(Number(e.target.value) || 1)}
+                className="input"
+              />
+            </Field>
+            <Toggle
+              label="Include read emails (--all)"
+              checked={compareAll}
+              onChange={setCompareAll}
+            />
+            <Toggle
+              label="Apply cleanup on agreement (otherwise dry-run)"
+              checked={compareApply}
+              onChange={setCompareApply}
+            />
+          </div>
+          <div className="flex gap-2 mt-4">
+            <button
+              onClick={onCompare}
+              disabled={!!busy}
+              className={compareApply ? "btn-danger" : "btn-primary"}
+            >
+              {busy === "compare"
+                ? "Comparing…"
+                : compareApply
+                  ? "Run compare + apply"
+                  : "Run compare (dry-run)"}
+            </button>
+            {busy === "compare" && (
               <button onClick={onCancel} className="btn-ghost">
                 Cancel
               </button>
