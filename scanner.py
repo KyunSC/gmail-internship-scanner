@@ -514,6 +514,45 @@ INTERNSHIP_KEYWORDS = (
     "intern", "internship", "stage", "stagiaire", "co-op", "coop", "student",
 )
 
+# Software / tech terms used to require a relevant field on aggregator-digest
+# listings. A buried internship chunk must also mention one of these to be
+# surfaced — drops Finance/HR/Business student opportunities that otherwise
+# slip through on a bare "student" hit. Phrases are intentionally specific
+# (e.g. "software engineering", not bare "engineering", which would match
+# "Bachelor of Commerce or Engineering degree").
+SOFTWARE_KEYWORDS = (
+    "software", "developer", "développeur", "developpeur",
+    "programmer", "programming", "coding",
+    "computer science", "computer engineering", "computer engineer",
+    "informatique", "génie logiciel", "genie logiciel",
+    "frontend", "front-end",
+    "backend", "back-end",
+    "full-stack", "fullstack", "full stack",
+    "devops", "site reliability",
+    "data science", "data scientist", "data analyst", "data engineer",
+    "machine learning", "deep learning",
+    "cybersecurity", "cyber security",
+    "cloud engineer", "cloud developer",
+    "embedded systems", "embedded software", "embedded engineer", "firmware",
+    "robotics",
+    "ios developer", "ios engineer", "android developer", "android engineer",
+    "mobile developer", "mobile engineer",
+    "python", "javascript", "typescript",
+    "automation tester", "automation engineer", "qa engineer", "qa analyst",
+    "qa automation", "test engineer", "sdet",
+    "tech intern", "technology intern", "it intern",
+    "software engineer", "software engineering",
+    "systems engineer", "systems engineering",
+    "hardware engineer", "fpga",
+    "sde intern", "swe intern",
+    "web developer", "web engineer",
+    # Title phrases — anchored so they only match the listing's role,
+    # not a degree requirement like "Bachelor of ... Engineering".
+    "engineering intern", "engineering internship",
+    "engineering co-op", "engineering coop", "engineering student",
+    "stage en génie", "stage en informatique", "stagiaire en informatique",
+)
+
 # "stage" alone matches English "Late Stage", "Early Stage", etc.
 # Only treat it as an internship signal in the body when French context surrounds it.
 _STAGE_FRENCH_RE = re.compile(
@@ -536,16 +575,56 @@ EXCLUDE_TERM_REGEX = re.compile(
 )
 
 
+_GLASSDOOR_LISTINGS_HEAD_RE = re.compile(
+    r"Your job listings for\s+\w+\s+\d+,\s+\d{4}",
+    re.IGNORECASE,
+)
+
+_GLASSDOOR_LISTINGS_FOOT_RE = re.compile(
+    r"See more jobs|Want more listings"
+)
+
+
+def _clean_glassdoor_body(body: str) -> str:
+    """Strip Glassdoor digest chrome before chunk analysis. Without this, the
+    user's saved alert name (e.g. "Backend Developer Internship") echoes in
+    the header banner, the listings subtitle, and the footer "Sent Daily Edit"
+    block — injecting "intern" + "developer" keywords into a digest whose
+    actual listings are all full-time. The footer also has "Create alert"
+    CTAs like "web developer intern Create" that hit the same way.
+
+    Removes everything up to and including the first ★ after "Your job
+    listings for [date]" (which drops the alert-name echo and the first
+    listing's company chip, since Glassdoor puts the company+rating BEFORE
+    its ★ separator), and trims from "See more jobs" / "Want more listings"
+    onward."""
+    m = _GLASSDOOR_LISTINGS_HEAD_RE.search(body)
+    if m:
+        body = body[m.end():]
+        star = body.find("★")
+        if star >= 0:
+            body = body[star + 1:]
+    m2 = _GLASSDOOR_LISTINGS_FOOT_RE.search(body)
+    if m2:
+        body = body[:m2.start()]
+    return body
+
+
 def _split_aggregator_listings(sender: str, body: str) -> list[str]:
     """Split a digest body into per-listing chunks. Glassdoor uses ★ as the
     listing separator (after each company's rating); Jobright closes each
-    recommendation with "APPLY NOW". Senders without a known digest format
-    return the whole body as a single chunk."""
+    recommendation with "APPLY NOW"; Indeed match digests close each listing
+    with "Easily apply". Senders without a known digest format return the whole
+    body as a single chunk. Glassdoor bodies are pre-cleaned to drop alert
+    chrome that would otherwise inject false internship signals."""
     s = (sender or "").lower()
     if "glassdoor.com" in s and "★" in body:
-        return [c.strip() for c in body.split("★") if c.strip()]
+        cleaned = _clean_glassdoor_body(body)
+        return [c.strip() for c in cleaned.split("★") if c.strip()]
     if "jobright.ai" in s and "APPLY NOW" in body:
         return [c.strip() for c in body.split("APPLY NOW") if c.strip()]
+    if "match.indeed.com" in s and "Easily apply" in body:
+        return [c.strip() for c in body.split("Easily apply") if c.strip()]
     return [body]
 
 
@@ -599,14 +678,36 @@ def _body_mentions_internship(body: str) -> bool:
     return False
 
 
+def _body_mentions_software(body: str) -> bool:
+    b = (body or "").lower()
+    return any(kw in b for kw in SOFTWARE_KEYWORDS)
+
+
+def _has_software_internship_listing(sender: str, body: str) -> bool:
+    """True iff at least one body chunk contains BOTH an internship keyword
+    AND a software/tech keyword. For aggregators with a known digest splitter
+    this is per-listing; without one it falls back to a whole-body co-occurrence
+    check (still strictly more strict than the previous "any intern keyword"
+    test)."""
+    for c in _split_aggregator_listings(sender, body):
+        if _body_mentions_internship(c) and _body_mentions_software(c):
+            return True
+    return False
+
+
 def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
-    """Combined signal check: keep if subject OR body has an internship keyword,
-    or if the sender is a recruiter/career address. The sender-only signal does NOT
-    count for aggregators (Glassdoor/LinkedIn/etc.) because their noreply addresses
-    would otherwise let every digest through."""
-    if _subject_mentions_internship(subject) or _body_mentions_internship(body):
+    """Combined signal check. Subject keyword always wins. For aggregator
+    digests, the body must contain a per-listing chunk that is BOTH an
+    internship AND software/tech — bare "student" hits in unrelated fields
+    (Finance, HR, Commerce) no longer pass. For non-aggregators, any body
+    internship keyword or recruiter-address sender is enough."""
+    if _subject_mentions_internship(subject):
         return True
-    return _is_recruiter_sender(sender) and not _is_aggregator(sender)
+    if _is_aggregator(sender):
+        return _has_software_internship_listing(sender, body)
+    if _body_mentions_internship(body):
+        return True
+    return _is_recruiter_sender(sender)
 
 
 
