@@ -180,7 +180,7 @@ def search_emails(service, query: str, max_results: int = 100) -> list[dict]:
     try:
         result = service.users().messages().list(
             userId="me", q=query, maxResults=max_results
-        ).execute()
+        ).execute(num_retries=3)
     except Exception as e:
         print(f"  [!] Search failed: {e}")
         return []
@@ -194,7 +194,7 @@ def search_emails(service, query: str, max_results: int = 100) -> list[dict]:
         try:
             msg = service.users().messages().get(
                 userId="me", id=msg_meta["id"], format="full"
-            ).execute()
+            ).execute(num_retries=3)
 
             payload = msg.get("payload", {})
             headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
@@ -953,7 +953,7 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
     while True:
         resp = service.users().messages().list(
             userId="me", q=query, maxResults=500, pageToken=page_token
-        ).execute()
+        ).execute(num_retries=3)
         candidates.extend(resp.get("messages", []) or [])
         page_token = resp.get("nextPageToken")
         if not page_token:
@@ -993,7 +993,7 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
             msg = service.users().messages().get(
                 userId="me", id=msg_id, format="metadata",
                 metadataHeaders=["From", "Subject", "Date"],
-            ).execute()
+            ).execute(num_retries=3)
             headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
             sender_raw = headers.get("From", "")
             date_raw = headers.get("Date", "")
@@ -1036,7 +1036,7 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
         service.users().messages().batchModify(
             userId="me",
             body={"ids": ids[i:i + 1000], "removeLabelIds": ["UNREAD"]},
-        ).execute()
+        ).execute(num_retries=3)
     print(f"  Marked {len(to_mark)} email(s) as read\n")
 
 
