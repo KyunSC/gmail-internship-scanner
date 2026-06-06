@@ -17,7 +17,9 @@ from scanner import (
     analyze_with_ollama,
     clean_inbox,
     get_gmail_service,
+    load_scan_cache,
     run_gmail_search,
+    save_scan_cache,
 )
 
 
@@ -73,6 +75,20 @@ def main():
 
     if not emails:
         print("No emails found.")
+        return
+
+    # ── Cache: skip already-analyzed emails ─────────────────────────────────
+    cached = load_scan_cache() or {}
+    seen_ids = {e.get("id") for e in cached.get("emails", []) if e.get("id")}
+    if seen_ids:
+        fresh = [e for e in emails if e.get("id") not in seen_ids]
+        skipped = len(emails) - len(fresh)
+        if skipped:
+            print(f"  Skipping {skipped} email(s) already in cache; {len(fresh)} new to analyze\n")
+        emails = fresh
+
+    if not emails:
+        print("  No new emails since the last scan.\n")
         return
 
     # ── Rule-based (full body, no LLM) ──────────────────────────────────────
