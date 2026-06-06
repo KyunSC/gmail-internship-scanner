@@ -308,8 +308,9 @@ CLASSIFICATION PRIORITY:
   its own. Strong signals: subject keywords (intern/co-op/stage/student), body content
   describing a student role, sender being a recruiter or career address.
 - For job-alert digest emails (LinkedIn, Glassdoor, Jobright), scan the ENTIRE body for
-  any internship/co-op/stage/student listing — not just the headline. Surface the email
-  if ANY listing in it is an internship, even if it appears in a recommendations section.
+  any internship/co-op/stage/student listing that is in the Montreal area OR remote/hybrid
+  — not just the headline. Surface the email if ANY listing in it qualifies, even if it
+  appears in a recommendations section.
 
 For each email, determine if it is one of:
 - Internship / co-op / stage / stagiaire job postings (STUDENT positions only)
@@ -333,6 +334,12 @@ STRICT RULES — these MUST be followed:
    directly (e.g. PCL, WSP, Staples, Indeed Apply confirmations) about YOUR internship
    applications ARE relevant and should be included.
 4. IGNORE newsletters, promotional emails, Quora digests, and unrelated content.
+5. LOCATION — only include job LISTINGS located in the Montreal area (Montreal,
+   Greater Montreal, Laval, Longueuil, Québec/QC) OR that are explicitly REMOTE or
+   HYBRID. EXCLUDE listings clearly located elsewhere (Toronto, Ottawa, Vancouver,
+   Calgary, USA, etc.) that are not remote/hybrid. EXCEPTION: application
+   confirmations, recruiter outreach, interview invitations, and status updates about
+   the user's OWN applications are always relevant — never drop those for location.
 
 OUTPUT FORMAT — return a JSON object with EXACTLY this shape:
 {{
@@ -376,7 +383,13 @@ INCLUDE only if at least one applies:
 - Body clearly describes a student / intern / co-op position
 - Recruiter or career-address message about an internship application
 For digest emails (LinkedIn, Glassdoor, Jobright), scan the FULL body — include if ANY \
-listing is an internship, even if buried in recommendations.
+listing is an internship that is in the Montreal area OR remote/hybrid, even if buried in \
+recommendations.
+
+LOCATION: include a listing only if it is in the Montreal area (Montreal, Laval, Longueuil, \
+Québec/QC) or is remote/hybrid; exclude listings clearly in other cities (Toronto, Ottawa, \
+Vancouver, USA) that are not remote/hybrid. Application confirmations, recruiter outreach, and \
+interview invites about the user's own applications are kept regardless of location.
 
 EXCLUDE: full-time roles ("junior", "senior", "mid-level", "lead", "associate", "engineer", \
 "developer", "analyst", "specialist") when not explicitly labeled as an internship; \
@@ -560,6 +573,32 @@ SOFTWARE_KEYWORDS = (
     "stage en génie", "stage en informatique", "stagiaire en informatique",
 )
 
+# Location filter — the user only wants internships they can actually take: in the
+# Montreal area, or remote/hybrid. A job LISTING must mention one of these to be
+# surfaced. Application confirmations, recruiter outreach, and interview invites are
+# kept regardless of location (enforced via the LLM prompt, and by leaving
+# non-aggregator emails un-location-filtered in the rule path).
+#
+# QC/Québec province terms are included because tech listings routinely write
+# "Montreal, QC" or just "QC"; this admits the occasional Quebec-City listing, which
+# is accepted as a rare false positive under the lenient setting. Word boundaries on
+# the short codes (mtl, qc, wfh) keep them from matching inside unrelated words.
+_LOCATION_REGEXES = (
+    re.compile(r"\bmontr[eé]al\b", re.IGNORECASE),
+    re.compile(r"\bmtl\b", re.IGNORECASE),
+    re.compile(r"\bgreater montreal\b", re.IGNORECASE),
+    re.compile(r"\bgrand montr[eé]al\b", re.IGNORECASE),
+    re.compile(r"\b(?:laval|longueuil|brossard)\b", re.IGNORECASE),
+    re.compile(r"\bqu[eé]bec\b", re.IGNORECASE),
+    re.compile(r"\bqc\b", re.IGNORECASE),
+    # Remote / hybrid arrangements (English + French).
+    re.compile(r"\bremote\b", re.IGNORECASE),
+    re.compile(r"\bt[eé]l[eé][\s\-]?travail\b", re.IGNORECASE),
+    re.compile(r"\bwork[\s\-]?from[\s\-]?home\b", re.IGNORECASE),
+    re.compile(r"\bwfh\b", re.IGNORECASE),
+    re.compile(r"\bhybride?\b", re.IGNORECASE),
+)
+
 # "stage" alone matches English "Late Stage", "Early Stage", etc.
 # Only treat it as an internship signal in the body when French context surrounds it.
 _STAGE_FRENCH_RE = re.compile(
@@ -690,14 +729,23 @@ def _body_mentions_software(body: str) -> bool:
     return any(kw in b for kw in SOFTWARE_KEYWORDS)
 
 
+def _mentions_location(text: str) -> bool:
+    """True if text names a Montreal-area location or a remote/hybrid arrangement.
+    Used to surface only listings the user can actually take (Montreal or remote)."""
+    if not text:
+        return False
+    return any(rx.search(text) for rx in _LOCATION_REGEXES)
+
+
 def _has_software_internship_listing(sender: str, body: str) -> bool:
-    """True iff at least one body chunk contains BOTH an internship keyword
-    AND a software/tech keyword. For aggregators with a known digest splitter
-    this is per-listing; without one it falls back to a whole-body co-occurrence
-    check (still strictly more strict than the previous "any intern keyword"
-    test)."""
+    """True iff at least one body chunk contains an internship keyword, a
+    software/tech keyword, AND a Montreal/remote location signal. For aggregators
+    with a known digest splitter this is per-listing; without one it falls back to
+    a whole-body co-occurrence check (still strictly stricter than the previous
+    "any intern keyword" test)."""
     for c in _split_aggregator_listings(sender, body):
-        if _body_mentions_internship(c) and _body_mentions_software(c):
+        if (_body_mentions_internship(c) and _body_mentions_software(c)
+                and _mentions_location(c)):
             return True
     return False
 
@@ -709,10 +757,11 @@ def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
     alone would otherwise let through. For aggregator digests, the per-chunk
     AND check (intern + software in the same listing) is the stricter form."""
     if _is_aggregator(sender):
-        # Subject-only intern keyword is enough only if the subject itself
-        # also names a software/tech role; otherwise rely on the per-chunk
-        # body listing check.
-        if _subject_mentions_internship(subject) and _body_mentions_software(subject):
+        # Subject-only intern keyword is enough only if the subject itself also
+        # names a software/tech role AND a Montreal/remote location; otherwise rely
+        # on the per-chunk body listing check (which also requires location).
+        if (_subject_mentions_internship(subject) and _body_mentions_software(subject)
+                and _mentions_location(subject)):
             return True
         return _has_software_internship_listing(sender, body)
     has_software = _body_mentions_software(subject) or _body_mentions_software(body)
