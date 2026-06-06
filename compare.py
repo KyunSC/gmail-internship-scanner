@@ -141,17 +141,23 @@ def main():
 
     print(f"\n{BOLD}{'='*70}{RESET}\n")
 
+    # ── Save cache ───────────────────────────────────────────────────────────
+    # Merge this run's emails + LLM-surfaced ids into the accumulated cache so
+    # the next compare run (and scanner.py) skips these emails.
+    cache = save_scan_cache(emails, llm_results)
+
     # ── Cleanup ─────────────────────────────────────────────────────────────
     # Mark aggregator emails as read when BOTH pipelines agreed they're not
     # internships. Keep set = union of what either pipeline surfaced (any
     # disagreement is treated as "keep unread" — safety bias). Emails outside
     # the fetched set still pass through clean_inbox's normal subject safety net.
-    keep_ids = rule_ids | llm_ids
-    email_cache = {e["id"]: e for e in emails if e.get("id")}
+    keep_ids = rule_ids | llm_ids | set(cache.get("kept_ids", []))
+    email_cache = {e["id"]: e for e in cache.get("emails", []) if e.get("id")}
     clean_inbox(
         service, days=args.days, apply=args.apply,
         email_cache=email_cache, keep_ids=keep_ids,
     )
+
 
 
 if __name__ == "__main__":
