@@ -696,18 +696,22 @@ def _has_software_internship_listing(sender: str, body: str) -> bool:
 
 
 def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
-    """Combined signal check. Subject keyword always wins. For aggregator
-    digests, the body must contain a per-listing chunk that is BOTH an
-    internship AND software/tech — bare "student" hits in unrelated fields
-    (Finance, HR, Commerce) no longer pass. For non-aggregators, any body
-    internship keyword or recruiter-address sender is enough."""
-    if _subject_mentions_internship(subject):
-        return True
+    """Combined signal check. An email must have BOTH an internship signal
+    AND a software/tech signal somewhere to pass. Filters out non-tech
+    internships (accounting, marketing, finance) that the subject keyword
+    alone would otherwise let through. For aggregator digests, the per-chunk
+    AND check (intern + software in the same listing) is the stricter form."""
     if _is_aggregator(sender):
+        # Subject-only intern keyword is enough only if the subject itself
+        # also names a software/tech role; otherwise rely on the per-chunk
+        # body listing check.
+        if _subject_mentions_internship(subject) and _body_mentions_software(subject):
+            return True
         return _has_software_internship_listing(sender, body)
-    if _body_mentions_internship(body):
-        return True
-    return _is_recruiter_sender(sender)
+    has_software = _body_mentions_software(subject) or _body_mentions_software(body)
+    if _subject_mentions_internship(subject) or _body_mentions_internship(body):
+        return has_software
+    return _is_recruiter_sender(sender) and has_software
 
 
 
@@ -1107,9 +1111,12 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
         if in_keep:
             kept_count += 1
             continue
-        # Safety net: keep unread if subject mentions an internship keyword. Covers
-        # emails the scanner missed because its per-query result cap (30) cut them off.
-        if _subject_mentions_internship(subject):
+        # Safety net: keep unread if subject mentions BOTH an internship keyword
+        # AND a software/tech keyword. Covers emails the scanner missed because
+        # its per-query result cap (30) cut them off, while still dropping
+        # non-tech internships (accounting, marketing) that the scanner now
+        # filters out. Subject-only check — we don't fetch the body here.
+        if _subject_mentions_internship(subject) and _body_mentions_software(subject):
             kept_subject_safety += 1
             continue
         to_mark.append({"id": meta["id"], "from": sender_raw, "subject": subject, "date": date_raw})
