@@ -27,9 +27,16 @@ SCOPE_MODIFY = "https://www.googleapis.com/auth/gmail.modify"
 
 TOKEN_PATH = Path(__file__).parent / "token.json"
 CREDS_PATH = Path(__file__).parent / "credentials.json"
-# Persisted snapshot of the most recent scan, used by --from-cache so cleanup can
-# skip the multi-minute LLM analysis when nothing material has changed.
+# Persisted snapshot of scans. Used by --from-cache so cleanup can skip the
+# multi-minute LLM analysis, and as the "seen" set so each scan skips emails it
+# already analyzed and focuses on new arrivals. Accumulated across runs.
 CACHE_PATH = Path(__file__).parent / ".last_scan.json"
+
+# Cap on how many seen-email records the cache retains, so the file stays bounded
+# across many runs. Far above a personal inbox's unread volume within the scan
+# window, so IDs only fall out of the seen set long after they've aged out of the
+# Gmail queries anyway. Oldest records are dropped first.
+SEEN_CACHE_MAX = 5000
 
 # Job-aggregator senders that --clean-inbox may mark as read. LinkedIn entries are
 # restricted to job-alert addresses (so newsletters / personal LinkedIn messages
@@ -1000,22 +1007,54 @@ def export_json(results: list[dict], path: str):
 
 # ── Scan cache ──────────────────────────────────────────────────────────────
 
-def save_scan_cache(emails: list[dict], results: list[dict]):
-    """Persist enough of the most recent scan that --from-cache can re-run the
-    cleanup without redoing the LLM analysis. We only store header-level fields
-    (no bodies) to keep the file small and avoid leaking content on disk."""
+def save_scan_cache(emails: list[dict], results: list[dict], merge: bool = True) -> dict:
+    """Persist this scan and return the resulting cache payload.
+
+    We only store header-level fields (no bodies) to keep the file small and
+    avoid leaking content on disk. The cache serves two purposes: --from-cache
+    reads it to re-run cleanup without the LLM, and the next scan reads its
+    `emails` ids as the "seen" set so it can skip what it already analyzed.
+
+    merge=True (default) accumulates this run's emails/kept_ids into the existing
+    cache so the seen set grows across runs. The email list is capped at
+    SEEN_CACHE_MAX, dropping the oldest records first; kept_ids are pruned to ids
+    still present in that capped set so they stay bounded too."""
     emails_min = [
         {"id": e.get("id", ""), "subject": e.get("subject", ""),
          "from": e.get("from", ""), "date": e.get("date", "")}
         for e in emails if e.get("id")
     ]
     kept_ids = [r.get("id") for r in results if r.get("id")]
+
+    existing = (load_scan_cache() or {}) if merge else {}
+    prev_emails = existing.get("emails", []) or []
+    prev_kept = existing.get("kept_ids", []) or []
+
+    # Merge emails by id, preserving order (oldest first) so the cap drops the
+    # oldest. A re-seen id keeps its slot but refreshes its stored metadata.
+    by_id: dict[str, dict] = {}
+    order: list[str] = []
+    for e in prev_emails + emails_min:
+        eid = e.get("id")
+        if not eid:
+            continue
+        if eid not in by_id:
+            order.append(eid)
+        by_id[eid] = e
+    merged_emails = [by_id[eid] for eid in order]
+    if len(merged_emails) > SEEN_CACHE_MAX:
+        merged_emails = merged_emails[-SEEN_CACHE_MAX:]
+
+    live_ids = {e["id"] for e in merged_emails}
+    merged_kept = [eid for eid in dict.fromkeys(prev_kept + kept_ids) if eid in live_ids]
+
     payload = {
         "scan_time": datetime.now().isoformat(timespec="seconds"),
-        "emails": emails_min,
-        "kept_ids": kept_ids,
+        "emails": merged_emails,
+        "kept_ids": merged_kept,
     }
     CACHE_PATH.write_text(json.dumps(payload))
+    return payload
 
 
 def load_scan_cache() -> dict | None:
@@ -1213,6 +1252,13 @@ def main():
         help="Use rule-based full-body keyword filter instead of the LLM. ~100x faster "
              "but no per-email summary. Useful for cleanup runs.",
     )
+    parser.add_argument(
+        "--rescan",
+        action="store_true",
+        help="Re-analyze emails already in the cache instead of skipping them. By "
+             "default each run skips emails seen in a previous scan and only analyzes "
+             "new arrivals.",
+    )
     args = parser.parse_args()
 
     if args.model:
@@ -1271,6 +1317,30 @@ def main():
         print("\n  No emails matched the search queries.\n")
         return
 
+    # Skip emails already analyzed in a previous run so each scan focuses on new
+    # arrivals. The cache accumulates every email it has seen; --rescan forces a
+    # full re-analysis of everything the queries returned.
+    cached = load_scan_cache() or {}
+    seen_ids = {e.get("id") for e in cached.get("emails", []) if e.get("id")}
+    if not args.rescan and seen_ids:
+        fresh = [e for e in emails if e.get("id") not in seen_ids]
+        skipped = len(emails) - len(fresh)
+        if skipped:
+            print(f"  Skipping {skipped} email(s) already scanned (in cache); {len(fresh)} new to analyze")
+        emails = fresh
+
+    if not emails:
+        print("\n  No new emails since the last scan.\n")
+        # Nothing new to analyze, but still clear inbox noise if asked — use the
+        # accumulated surfaced set (same keep logic as --from-cache).
+        if args.clean_inbox:
+            email_cache = {e["id"]: e for e in cached.get("emails", []) if e.get("id")}
+            clean_inbox(
+                service, days=args.days, apply=args.apply,
+                email_cache=email_cache, keep_ids=set(cached.get("kept_ids", [])),
+            )
+        return
+
     # Analyze
     if args.fast:
         print("[2/2] Rule-based analysis (no LLM)...")
@@ -1282,18 +1352,22 @@ def main():
     # Display
     display_results(results)
 
-    # Save cache so --from-cache can run a near-instant cleanup later without
-    # redoing the LLM analysis.
-    save_scan_cache(emails, results)
+    # Save cache (merging into the accumulated seen-set) so the next scan skips
+    # these and --from-cache can run a near-instant cleanup later.
+    cache = save_scan_cache(emails, results)
 
     # Export
     if args.output:
         export_json(results, args.output)
 
-    # Inbox cleanup
+    # Inbox cleanup. Match the keep-set by id against the accumulated surfaced
+    # ids so emails surfaced in earlier runs — skipped this time — stay unread.
     if args.clean_inbox:
-        email_cache = {e["id"]: e for e in emails if e.get("id")}
-        clean_inbox(service, results, days=args.days, apply=args.apply, email_cache=email_cache)
+        email_cache = {e["id"]: e for e in cache.get("emails", []) if e.get("id")}
+        clean_inbox(
+            service, days=args.days, apply=args.apply,
+            email_cache=email_cache, keep_ids=set(cache.get("kept_ids", [])),
+        )
 
 
 if __name__ == "__main__":

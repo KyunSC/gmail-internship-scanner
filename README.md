@@ -23,7 +23,7 @@ gmail-internship-scanner/
 ├── show_bodies.py     # Dev tool: prints extracted body text for specific emails
 ├── credentials.json   # Google OAuth client secret (not committed)
 ├── token.json         # Cached OAuth token (not committed)
-├── .last_scan.json    # Last scan snapshot for --from-cache (not committed)
+├── .last_scan.json    # Accumulated scan snapshot — seen emails for incremental scans + --from-cache (not committed)
 └── requirements.txt
 ```
 
@@ -100,6 +100,7 @@ Scans unread emails from the last 30 days, classifies them with Ollama, and prin
 | `--apply` | Actually apply the `--clean-inbox` changes | dry run |
 | `--from-cache` | Skip the LLM scan and run `--clean-inbox` against the previous run's cached results (`~1 sec` instead of ~5 min) | off |
 | `--fast` | Skip the LLM and use the full-body rule-based keyword filter only (~50× faster, no per-email summary) | off |
+| `--rescan` | Re-analyze emails already in the cache instead of skipping them | skip seen emails |
 
 ### Examples
 
@@ -115,6 +116,9 @@ python scanner.py -m qwen2.5:7b
 
 # Search by keyword and export to file
 python scanner.py -k "internship" -o results.json
+
+# Re-analyze everything, including emails seen in a previous scan
+python scanner.py --rescan
 
 # Scan and clean inbox in one step (dry run first)
 python scanner.py --clean-inbox
@@ -139,6 +143,27 @@ python scanner.py --debug
 OLLAMA_URL=http://localhost:11434   # Ollama server URL
 OLLAMA_MODEL=qwen3.5:9b             # Default model (override with -m)
 ```
+
+---
+
+## Incremental scans (skip already-seen emails)
+
+Every scan records the emails it analyzed in `.last_scan.json`. On the next run the scanner skips anything already in that cache and only analyzes **new arrivals** — so re-running is fast and each run's output is just what's landed since last time.
+
+```bash
+python scanner.py        # first run: analyzes everything in the window
+python scanner.py        # later run: "Skipping N email(s) already scanned; M new to analyze"
+```
+
+The seen-set accumulates across runs (capped at 5000 records, oldest dropped first), so emails stay skipped even if they're still unread. If nothing new has arrived, the scan prints `No new emails since the last scan.` and exits (still running `--clean-inbox` if requested, using the accumulated surfaced set).
+
+To re-analyze everything the queries return — ignoring the cache — pass `--rescan`:
+
+```bash
+python scanner.py --rescan
+```
+
+> The cache stores only message IDs, subjects, senders, and dates — no bodies. Delete `.last_scan.json` to reset the seen-set and start fresh.
 
 ---
 
