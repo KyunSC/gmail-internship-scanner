@@ -153,10 +153,15 @@ def main():
     # the fetched set still pass through clean_inbox's normal subject safety net.
     keep_ids = rule_ids | llm_ids | set(cache.get("kept_ids", []))
     email_cache = {e["id"]: e for e in cache.get("emails", []) if e.get("id")}
-    clean_inbox(
+    marked = clean_inbox(
         service, days=args.days, apply=args.apply,
         email_cache=email_cache, keep_ids=keep_ids,
     )
+    # Fold the emails we just marked read into the seen-set so they're tracked
+    # like analyzed emails (and skipped by future runs). Not added to kept_ids —
+    # they were the noise we cleared, not internships.
+    if marked:
+        save_scan_cache(marked, [])
 
 
 

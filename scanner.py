@@ -1131,6 +1131,9 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
     not in the cache are still processed by the standard rules (surfaced /
     subject safety net) because the query already restricts to known aggregator
     senders.
+
+    Returns the list of emails actually marked read (empty on dry-run or when
+    there's nothing to mark) so callers can fold them into the scan cache.
     """
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
     sender_clauses = " OR ".join(f"from:{s}" for s in CLEAN_INBOX_SENDERS)
@@ -1215,7 +1218,7 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
 
     if not to_mark:
         print("  Nothing to mark.\n")
-        return
+        return []
 
     for m in to_mark:
         print(f"  • {m['subject'][:70]}")
@@ -1223,7 +1226,7 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
 
     if not apply:
         print(f"\n  {DIM}(Dry run — re-run with --apply to mark these {len(to_mark)} emails as read){RESET}\n")
-        return
+        return []
 
     print(f"\n  Marking {len(to_mark)} email(s) as read…")
     ids = [m["id"] for m in to_mark]
@@ -1234,6 +1237,7 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
             body={"ids": ids[i:i + 1000], "removeLabelIds": ["UNREAD"]},
         ).execute(num_retries=3)
     print(f"  Marked {len(to_mark)} email(s) as read\n")
+    return to_mark
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -1335,10 +1339,14 @@ def main():
         service = get_gmail_service(write_access=True)
         email_cache = {e["id"]: e for e in cached.get("emails", []) if e.get("id")}
         keep_ids = set(cached.get("kept_ids", []))
-        clean_inbox(
+        marked = clean_inbox(
             service, days=args.days, apply=args.apply, email_cache=email_cache,
             keep_ids=keep_ids,
         )
+        # Fold the emails we just marked read into the seen-set so they're
+        # tracked like analyzed emails. Not added to kept_ids — they're noise.
+        if marked:
+            save_scan_cache(marked, [])
         return
 
     # Check Ollama (unless --fast, which skips the LLM entirely)
@@ -1384,10 +1392,12 @@ def main():
         # accumulated surfaced set (same keep logic as --from-cache).
         if args.clean_inbox:
             email_cache = {e["id"]: e for e in cached.get("emails", []) if e.get("id")}
-            clean_inbox(
+            marked = clean_inbox(
                 service, days=args.days, apply=args.apply,
                 email_cache=email_cache, keep_ids=set(cached.get("kept_ids", [])),
             )
+            if marked:
+                save_scan_cache(marked, [])
         return
 
     # Analyze
@@ -1413,10 +1423,12 @@ def main():
     # ids so emails surfaced in earlier runs — skipped this time — stay unread.
     if args.clean_inbox:
         email_cache = {e["id"]: e for e in cache.get("emails", []) if e.get("id")}
-        clean_inbox(
+        marked = clean_inbox(
             service, days=args.days, apply=args.apply,
             email_cache=email_cache, keep_ids=set(cache.get("kept_ids", [])),
         )
+        if marked:
+            save_scan_cache(marked, [])
 
 
 if __name__ == "__main__":
