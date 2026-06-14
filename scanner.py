@@ -49,6 +49,7 @@ CLEAN_INBOX_SENDERS = (
     "noreply@jobright.ai",
     "alert@indeed.com",
     "noreply@indeed.com",
+    "no-reply@indeed.com",
     # Indeed's job-match subdomain — uses donotreply@match.indeed.com and similar.
     # Substring matches `from:` so any address under match.indeed.com is caught.
     "match.indeed.com",
@@ -708,20 +709,41 @@ def _is_recruiter_sender(sender: str) -> bool:
     return any(h in s for h in RECRUITER_SENDER_HINTS)
 
 
+# Indeed sends engagement/marketing nudges from no-reply@indeed.com — e.g.
+# "Stand out by sending a quick message to {company}" / "Confirm your interest".
+# Their bodies reference a role + location, so the normal intern+software+location
+# co-occurrence wrongly surfaces them as internships. These are never job
+# postings: real job alerts come from match.indeed.com and application
+# confirmations from indeedapply@indeed.com, both of which keep normal handling.
+INDEED_NOISE_SENDERS = ("no-reply@indeed.com", "noreply@indeed.com")
+
+
+def _is_indeed_noise_sender(sender: str) -> bool:
+    s = (sender or "").lower()
+    return any(addr in s for addr in INDEED_NOISE_SENDERS)
+
+
+# Word-boundary patterns for internship keywords. Plain substring matching wrongly
+# fires on superstrings: "intern" inside "international/internal/internet", "coop"
+# inside "cooperative", "co-op" inside "co-operative". Anchored alternatives with
+# explicit plural handling avoid that while still catching plurals. "stage" is
+# excluded here — too noisy in English ("late/early stage") — and handled
+# separately (subject: bare word; body: French context only, via _STAGE_FRENCH_RE).
+_INTERNSHIP_WORD_RE = re.compile(
+    r"\b(?:interns?|internships?|stagiaires?|students?|co-?ops?)\b",
+    re.IGNORECASE,
+)
+_STAGE_WORD_RE = re.compile(r"\bstages?\b", re.IGNORECASE)
+
+
 def _subject_mentions_internship(subject: str) -> bool:
-    s = (subject or "").lower()
-    return any(kw in s for kw in INTERNSHIP_KEYWORDS)
+    s = subject or ""
+    return bool(_INTERNSHIP_WORD_RE.search(s) or _STAGE_WORD_RE.search(s))
 
 
 def _body_mentions_internship(body: str) -> bool:
-    b = (body or "").lower()
-    for kw in INTERNSHIP_KEYWORDS:
-        if kw == "stage":
-            if _STAGE_FRENCH_RE.search(body):
-                return True
-        elif kw in b:
-            return True
-    return False
+    b = body or ""
+    return bool(_INTERNSHIP_WORD_RE.search(b) or _STAGE_FRENCH_RE.search(b))
 
 
 def _body_mentions_software(body: str) -> bool:
@@ -756,6 +778,10 @@ def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
     internships (accounting, marketing, finance) that the subject keyword
     alone would otherwise let through. For aggregator digests, the per-chunk
     AND check (intern + software in the same listing) is the stricter form."""
+    # Indeed engagement nudges (no-reply@indeed.com) aren't job postings even
+    # though their bodies mention a role + location — never surface them.
+    if _is_indeed_noise_sender(sender):
+        return False
     if _is_aggregator(sender):
         # Subject-only intern keyword is enough only if the subject itself also
         # names a software/tech role AND a Montreal/remote location; otherwise rely

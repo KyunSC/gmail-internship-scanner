@@ -89,6 +89,15 @@ def main():
 
     if not emails:
         print("  No new emails since the last scan.\n")
+        # Nothing new to analyze, but still run cleanup against the accumulated
+        # cache so the keep-set logic (and newly-cleanable senders) still apply.
+        email_cache = {e["id"]: e for e in cached.get("emails", []) if e.get("id")}
+        marked = clean_inbox(
+            service, days=args.days, apply=args.apply,
+            email_cache=email_cache, keep_ids=set(cached.get("kept_ids", [])),
+        )
+        if marked:
+            save_scan_cache(marked, [])
         return
 
     # ── Rule-based (full body, no LLM) ──────────────────────────────────────
