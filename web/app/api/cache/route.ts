@@ -18,6 +18,24 @@ async function readJson<T>(file: string): Promise<T | null> {
   }
 }
 
+async function removeIfPresent(file: string): Promise<string | null> {
+  try {
+    await fs.unlink(file);
+    return path.basename(file);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+export async function DELETE() {
+  const removed = (
+    await Promise.all([removeIfPresent(SCAN_CACHE), removeIfPresent(RESULTS_CACHE)])
+  ).filter((name): name is string => name !== null);
+
+  return NextResponse.json({ removed });
+}
+
 export async function GET() {
   const [scan, results] = await Promise.all([
     readJson<{

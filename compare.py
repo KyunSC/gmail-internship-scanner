@@ -16,6 +16,7 @@ from scanner import (
     _has_internship_signal,
     analyze_with_ollama,
     clean_inbox,
+    clear_scan_cache,
     get_gmail_service,
     load_scan_cache,
     run_gmail_search,
@@ -62,7 +63,22 @@ def main():
         help="Mark aggregator emails as read when BOTH pipelines agree they're "
              "not internships. Dry-run unless this flag is given.",
     )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Delete the scan cache (.last_scan.json) and exported results "
+             "(.last_results.json), then exit. The next run re-analyzes every "
+             "email from scratch.",
+    )
     args = parser.parse_args()
+
+    if args.clear_cache:
+        removed = clear_scan_cache()
+        if removed:
+            print(f"Cleared cache: {', '.join(removed)}")
+        else:
+            print("Cache already empty — nothing to clear.")
+        return
 
     print(f"\n{BOLD}Scanner Comparison: LLM vs rule-based{RESET}\n")
 

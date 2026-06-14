@@ -31,6 +31,9 @@ CREDS_PATH = Path(__file__).parent / "credentials.json"
 # multi-minute LLM analysis, and as the "seen" set so each scan skips emails it
 # already analyzed and focuses on new arrivals. Accumulated across runs.
 CACHE_PATH = Path(__file__).parent / ".last_scan.json"
+# Default export target for analysis results (the web dashboard reads this).
+# Cleared alongside CACHE_PATH by --clear-cache.
+RESULTS_PATH = Path(__file__).parent / ".last_results.json"
 
 # Cap on how many seen-email records the cache retains, so the file stays bounded
 # across many runs. Far above a personal inbox's unread volume within the scan
@@ -1141,6 +1144,17 @@ def load_scan_cache() -> dict | None:
         return None
 
 
+def clear_scan_cache() -> list[str]:
+    """Delete the persisted scan cache and exported results so the next run
+    re-analyzes every email from scratch. Returns the names of files removed."""
+    removed = []
+    for p in (CACHE_PATH, RESULTS_PATH):
+        if p.exists():
+            p.unlink()
+            removed.append(p.name)
+    return removed
+
+
 # ── Inbox cleanup ───────────────────────────────────────────────────────────
 
 def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
@@ -1338,7 +1352,22 @@ def main():
              "default each run skips emails seen in a previous scan and only analyzes "
              "new arrivals.",
     )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Delete the scan cache (.last_scan.json) and exported results "
+             "(.last_results.json), then exit. The next scan re-analyzes every "
+             "email from scratch.",
+    )
     args = parser.parse_args()
+
+    if args.clear_cache:
+        removed = clear_scan_cache()
+        if removed:
+            print(f"Cleared cache: {', '.join(removed)}")
+        else:
+            print("Cache already empty — nothing to clear.")
+        return
 
     if args.model:
         OLLAMA_MODEL = args.model

@@ -46,6 +46,7 @@ const PRIORITY_TONE: Record<string, string> = {
 export default function Dashboard() {
   const [cache, setCache] = useState<CacheResponse | null>(null);
   const [loadingCache, setLoadingCache] = useState(true);
+  const [clearingCache, setClearingCache] = useState(false);
 
   // Scan controls
   const [keyword, setKeyword] = useState("");
@@ -82,6 +83,32 @@ export default function Dashboard() {
       setLoadingCache(false);
     }
   }, []);
+
+  const clearCache = useCallback(async () => {
+    if (busy || clearingCache) return;
+    if (
+      !window.confirm(
+        "Clear the scan cache and results? The next scan will re-analyze every email from scratch.",
+      )
+    )
+      return;
+    setClearingCache(true);
+    try {
+      const res = await fetch("/api/cache", { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      const { removed } = (await res.json()) as { removed: string[] };
+      setLog(
+        removed.length
+          ? `Cleared cache: ${removed.join(", ")}\n`
+          : "Cache already empty — nothing to clear.\n",
+      );
+    } catch (err) {
+      setLog(`[client error] ${(err as Error).message}\n`);
+    } finally {
+      setClearingCache(false);
+      refreshCache();
+    }
+  }, [busy, clearingCache, refreshCache]);
 
   useEffect(() => {
     refreshCache();
@@ -432,6 +459,16 @@ export default function Dashboard() {
       <section>
         <Panel
           title={`All scanned emails${scannedEmails.length ? ` (${scannedEmails.length})` : ""}`}
+          headerRight={
+            <button
+              onClick={clearCache}
+              disabled={!!busy || clearingCache}
+              className="text-xs text-[color:var(--color-danger)] hover:opacity-80 disabled:opacity-40"
+              title="Delete the scan cache so the next scan re-analyzes everything"
+            >
+              {clearingCache ? "Clearing…" : "Clear cache"}
+            </button>
+          }
         >
           {cache?.scan?.scan_time && (
             <p className="text-xs text-[color:var(--color-muted)] mb-3">
