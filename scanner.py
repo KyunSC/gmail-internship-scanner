@@ -139,6 +139,27 @@ def _html_to_text(html: str) -> str:
     return " ".join(p.parts)
 
 
+# Footer boilerplate markers. Everything from one of these to the end is the
+# sender's unsubscribe/identity footer, never a job listing. LinkedIn's footer
+# carries the recipient's own profile tagline ("… Software Engineering Co-op @
+# McGill …"), whose "Co-op" wrongly trips the internship keyword filter. The
+# listings always sit above the marker, so cutting here removes the false
+# positive without dropping any real posting. Each marker is sender-specific
+# text, so trimming generically is safe — it only fires on that sender's mail.
+_FOOTER_MARKERS = (
+    "This email was intended for",  # LinkedIn
+)
+
+
+def _strip_footer(text: str) -> str:
+    cut = len(text)
+    for marker in _FOOTER_MARKERS:
+        i = text.find(marker)
+        if i != -1:
+            cut = min(cut, i)
+    return text[:cut].strip()
+
+
 def _normalize_body(text: str) -> str:
     text = html.unescape(text)
     text = re.sub("[​-‏‪-‮⁠﻿]", "", text)
@@ -146,7 +167,7 @@ def _normalize_body(text: str) -> str:
     text = re.sub(r"\s+", " ", text)
     # Collapse runs of any single non-alphanumeric char (decorative separators like ===, ---, ***)
     text = re.sub(r"([^\w\s])\1{3,}", r"\1\1\1", text)
-    return text.strip()
+    return _strip_footer(text.strip())
 
 
 def _extract_body(payload: dict) -> str:
