@@ -1,4 +1,4 @@
-#!/Users/sunnychen/Developper/PersonalProjects/gmail-internship-scanner/cli/venv/bin/python3
+#!/Users/sunnychen/Developper/PersonalProjects/gmail-internship-scanner/cli/venv/bin/python3.13
 import sys
 from google_auth_oauthlib.tool.__main__ import main
 if __name__ == '__main__':

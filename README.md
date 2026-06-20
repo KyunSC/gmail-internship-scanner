@@ -18,14 +18,18 @@ Gmail (Google servers) --API--> Your machine --Ollama--> Results (local only)
 
 ```
 gmail-internship-scanner/
-├── scanner.py         # Main scanner — Gmail fetch + Ollama LLM analysis
-├── compare.py         # Dev tool: runs both LLM and rule-based filter, diffs results
-├── show_bodies.py     # Dev tool: prints extracted body text for specific emails
-├── credentials.json   # Google OAuth client secret (not committed)
-├── token.json         # Cached OAuth token (not committed)
-├── .last_scan.json    # Accumulated scan snapshot — seen emails for incremental scans + --from-cache (not committed)
-└── requirements.txt
+├── cli/                   # Local command-line scanner (Python) — this README
+│   ├── scanner.py         # Main scanner — Gmail fetch + Ollama LLM analysis
+│   ├── compare.py         # Dev tool: runs both LLM and rule-based filter, diffs results
+│   ├── show_bodies.py     # Dev tool: prints extracted body text for specific emails
+│   ├── credentials.json   # Google OAuth client secret (not committed)
+│   ├── token.json         # Cached OAuth token (not committed)
+│   ├── .last_scan.json    # Accumulated scan snapshot — seen emails for incremental scans + --from-cache (not committed)
+│   └── requirements.txt
+└── web/                   # Browser dashboard (fully client-side; runs Gmail + LLM in the browser)
 ```
+
+> **The commands in this README are run from the `cli/` directory** — `cd cli` first (or prefix paths with `cli/`). The browser app under `web/` is separate and shares nothing with the CLI at runtime.
 
 ---
 
@@ -64,12 +68,13 @@ ollama serve
    - APIs & Services > Credentials > Create Credentials > OAuth client ID
    - Configure the consent screen if prompted (External is fine; add your email as a test user)
    - Application type: **Desktop app**
-   - Download the JSON and rename it to `credentials.json`, placed in this folder
+   - Download the JSON and rename it to `credentials.json`, placed in the `cli/` folder
 5. On first run a browser window opens for authorization. A `token.json` is saved for future runs.
 
 ### 3. Install Python dependencies
 
 ```bash
+cd cli
 pip install -r requirements.txt
 ```
 
