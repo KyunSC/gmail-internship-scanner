@@ -75,8 +75,16 @@ ollama serve
 
 ```bash
 cd cli
-pip install -r requirements.txt
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -r requirements.txt
 ```
+
+> **Run the Python commands below from the `cli/` virtual environment.** Activate it
+> with `source venv/bin/activate` each time you open a new terminal, then use the
+> documented `python ...` commands. Alternatively, without activating it, prefix a
+> command with the virtual-environment interpreter—for example,
+> `venv/bin/python scanner.py` or `venv/bin/python compare.py --apply`.
 
 ---
 

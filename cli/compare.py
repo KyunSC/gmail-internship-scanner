@@ -35,7 +35,7 @@ def rule_based_filter(emails: list[dict]) -> tuple[list[dict], list[dict]]:
         if not _has_internship_signal(subject, body, sender):
             dropped.append({**e, "_drop_reason": "no internship signal"})
         elif _all_intern_listings_excluded(sender, body):
-            dropped.append({**e, "_drop_reason": "all listings are Fall 2026 / Sept 2026"})
+            dropped.append({**e, "_drop_reason": "all listings off-target (not Fall 2026 / Winter 2027)"})
         else:
             kept.append(e)
     return kept, dropped

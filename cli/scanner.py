@@ -567,7 +567,9 @@ INTERNSHIP_KEYWORDS = (
 # "Bachelor of Commerce or Engineering degree").
 SOFTWARE_KEYWORDS = (
     "software", "developer", "développeur", "developpeur",
+    "développement", "developpement",
     "programmer", "programming", "coding",
+    "artificial intelligence", "intelligence artificielle",
     "computer science", "computer engineering", "computer engineer",
     "informatique", "génie logiciel", "genie logiciel",
     "frontend", "front-end",
@@ -632,16 +634,31 @@ _STAGE_FRENCH_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Terms for internships the user does NOT want surfaced (currently Fall 2026 /
-# September 2026 starts). Per-listing filter — we split aggregator digests into
-# individual job listings and drop the email only if EVERY intern listing in it
-# is Fall/Sept. If at least one Summer/other-term intern listing survives in the
-# same email, the email is kept.
-EXCLUDE_TERM_REGEX = re.compile(
+# The internship terms the user IS targeting: Fall 2026 and Winter 2027 starts.
+# Covers French (automne/hiver) and the September/January month forms aggregators
+# use, plus short season codes (F2026, W2027). A listing matching this is always
+# kept.
+TARGET_TERM_REGEX = re.compile(
     r"\b(fall|automne)\b.{0,20}\b2026\b"
     r"|\b2026\b.{0,20}\b(fall|automne)\b"
     r"|\bsept(\.|ember|embre)?\s*\.?\s*2026\b"
-    r"|\b[fa][-\s]?2026\b",
+    r"|\b[fa][-\s]?2026\b"
+    r"|\b(winter|hiver)\b.{0,20}\b2027\b"
+    r"|\b2027\b.{0,20}\b(winter|hiver)\b"
+    r"|\bjan(\.|uary|vier)?\s*\.?\s*2027\b"
+    r"|\b[wh][-\s]?2027\b",
+    re.IGNORECASE,
+)
+
+# Any explicit season/term + year mention. Paired with TARGET_TERM_REGEX to tell
+# an OFF-TARGET term (e.g. Summer 2026, Fall 2027) apart from a listing that
+# names no season at all. Off-target listings are dropped; no-season listings are
+# kept (lenient — we'd rather surface an undated posting than miss one).
+SEASON_TERM_REGEX = re.compile(
+    r"\b(?:fall|automne|spring|printemps|summer|[ée]t[ée]|winter|hiver)\b.{0,20}\b20\d\d\b"
+    r"|\b20\d\d\b.{0,20}\b(?:fall|automne|spring|printemps|summer|[ée]t[ée]|winter|hiver)\b"
+    r"|\b(?:jan(?:\.|uary|vier)?|sept(?:\.|ember|embre)?|may|mai)\s*\.?\s*20\d\d\b"
+    r"|\b[fwas][-\s]?20\d\d\b",
     re.IGNORECASE,
 )
 
@@ -699,9 +716,17 @@ def _split_aggregator_listings(sender: str, body: str) -> list[str]:
     return [body]
 
 
+def _is_off_target_term(chunk: str) -> bool:
+    """True if a listing names an explicit season/term other than the ones the
+    user targets (Fall 2026 / Winter 2027). A listing with no recognizable
+    season is NOT off-target — it's kept (lenient)."""
+    return bool(SEASON_TERM_REGEX.search(chunk)) and not TARGET_TERM_REGEX.search(chunk)
+
+
 def _all_intern_listings_excluded(sender: str, body: str) -> bool:
-    """True if every chunk containing an internship keyword also matches the
-    Fall/Sept exclusion. False if any non-Fall intern listing exists, or if no
+    """True if every chunk containing an internship keyword names an off-target
+    term (a season other than Fall 2026 / Winter 2027). False if any intern
+    listing targets Fall 2026 / Winter 2027 or states no season at all, or if no
     chunk has an intern keyword (in which case the filter shouldn't fire)."""
     intern_chunks = [
         c for c in _split_aggregator_listings(sender, body)
@@ -709,7 +734,7 @@ def _all_intern_listings_excluded(sender: str, body: str) -> bool:
     ]
     if not intern_chunks:
         return False
-    return all(EXCLUDE_TERM_REGEX.search(c) for c in intern_chunks)
+    return all(_is_off_target_term(c) for c in intern_chunks)
 
 
 RECRUITER_SENDER_HINTS = (
@@ -956,11 +981,11 @@ def analyze_with_ollama(
             dropped_aggregator += 1
             continue
 
-        # Per-listing Fall 2026 / September 2026 exclusion (body only — subject
-        # is intentionally not checked). For digest aggregators the body is split
+        # Per-listing off-target-term exclusion (body only — subject is
+        # intentionally not checked). For digest aggregators the body is split
         # into individual job listings; we drop the email only if EVERY intern
-        # listing in it is Fall/Sept. A mixed digest with one Summer intern still
-        # passes.
+        # listing names a season other than Fall 2026 / Winter 2027. A mixed
+        # digest with one on-target (or undated) intern still passes.
         body = original.get("body", "")
         if _all_intern_listings_excluded(sender, body):
             dropped_term += 1
@@ -979,7 +1004,7 @@ def analyze_with_ollama(
     if dropped_aggregator:
         print(f"  Filtered out {dropped_aggregator} aggregator email(s) without internship keywords")
     if dropped_term:
-        print(f"  Filtered out {dropped_term} email(s) whose body mentions Fall 2026 / September 2026")
+        print(f"  Filtered out {dropped_term} email(s) whose listings are all off-target (not Fall 2026 / Winter 2027)")
     if dropped_dup:
         print(f"  Filtered out {dropped_dup} duplicate email(s) (LLM hallucination)")
     if dropped_unmatched:
@@ -1023,7 +1048,7 @@ def rule_based_analyze(emails: list[dict]) -> list[dict]:
     if dropped_no_signal:
         print(f"  Dropped {dropped_no_signal} email(s) with no internship signal")
     if dropped_term:
-        print(f"  Dropped {dropped_term} email(s) whose body mentions Fall 2026 / September 2026")
+        print(f"  Dropped {dropped_term} email(s) whose listings are all off-target (not Fall 2026 / Winter 2027)")
     return out
 
 
