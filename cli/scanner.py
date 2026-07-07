@@ -331,9 +331,13 @@ PROMPT_DEFAULT = """You are analyzing a student's inbox for internship and job-r
 CLASSIFICATION PRIORITY:
 - Combine signals from the SUBJECT, BODY, and SENDER. No single field is decisive on
   its own. Strong signals: subject keywords (intern/co-op/stage/student), body content
-  describing a student role, sender being a recruiter or career address.
+  describing a student role, sender being a recruiter or career address. Research,
+  R&D, researcher, and research-assistant roles (including French equivalents such
+  as recherche, chercheur/chercheuse, and assistant/auxiliaire de recherche) count
+  as relevant technical fields when they are explicitly internships/student roles.
 - For job-alert digest emails (LinkedIn, Glassdoor, Jobright), scan the ENTIRE body for
-  any internship/co-op/stage/student listing that is in the Montreal area OR remote/hybrid
+  any internship/co-op/stage/student listing, including research/R&D internships, that
+  is in the Montreal area OR remote/hybrid
   — not just the headline. Surface the email if ANY listing in it qualifies, even if it
   appears in a recommendations section.
 
@@ -402,6 +406,10 @@ Emails:
 PROMPT_TIGHT = """Classify emails for a student's internship search. For each email decide whether \
 it relates to an internship / co-op / stage / stagiaire / student role — the listing itself, \
 recruiter outreach, application confirmations, status updates, or interview messages.
+
+Research, R&D, researcher, and research-assistant roles count as relevant technical fields \
+when explicitly labeled as internships/student roles. This includes French equivalents such \
+as recherche, chercheur/chercheuse, and assistant/auxiliaire de recherche.
 
 INCLUDE only if at least one applies:
 - Subject contains intern, internship, stage, stagiaire, co-op, coop, or student
@@ -578,6 +586,15 @@ SOFTWARE_KEYWORDS = (
     "devops", "site reliability",
     "data science", "data scientist", "data analyst", "data engineer",
     "machine learning", "deep learning",
+    # Research roles are common in AI/software internship alerts. Include both
+    # English and French title variants so the shared rule pre-filter, LLM
+    # pre-filter, and cleanup subject safety net all recognize them.
+    "research", "researcher", "research assistant",
+    "research scientist", "research engineering", "research engineer",
+    "research and development", "r&d", "r & d",
+    "recherche", "chercheur", "chercheuse",
+    "assistant de recherche", "assistante de recherche",
+    "auxiliaire de recherche", "ingénieur de recherche", "ingenieur de recherche",
     "cybersecurity", "cyber security",
     "cloud engineer", "cloud developer",
     "embedded systems", "embedded software", "embedded engineer", "firmware",
