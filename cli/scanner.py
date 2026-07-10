@@ -369,6 +369,10 @@ STRICT RULES — these MUST be followed:
    Calgary, USA, etc.) that are not remote/hybrid. EXCEPTION: application
    confirmations, recruiter outreach, interview invitations, and status updates about
    the user's OWN applications are always relevant — never drop those for location.
+6. EXCLUDE QA/testing-focused roles, even if they are internships or co-ops:
+   QA Engineer, QA Analyst, Quality Assurance, Software Tester, Automation Tester,
+   Test Engineer, Testing Intern, and SDET. Automation Engineer roles are relevant
+   unless the listing is explicitly QA/testing-focused.
 
 OUTPUT FORMAT — return a JSON object with EXACTLY this shape:
 {{
@@ -426,7 +430,9 @@ interview invites about the user's own applications are kept regardless of locat
 
 EXCLUDE: full-time roles ("junior", "senior", "mid-level", "lead", "associate", "engineer", \
 "developer", "analyst", "specialist") when not explicitly labeled as an internship; \
-newsletters; promos; Quora digests.
+QA/testing-focused roles such as QA Engineer, QA Analyst, Quality Assurance, Software \
+Tester, Automation Tester, Test Engineer, Testing Intern, or SDET; newsletters; promos; \
+Quora digests. Automation Engineer roles are relevant unless explicitly QA/testing-focused.
 
 Return ONLY this JSON, fields verbatim:
 {{"results": [{{"email_index": <int from the block>, "subject": "<verbatim>", \
@@ -602,8 +608,7 @@ SOFTWARE_KEYWORDS = (
     "ios developer", "ios engineer", "android developer", "android engineer",
     "mobile developer", "mobile engineer",
     "python", "javascript", "typescript",
-    "automation tester", "automation engineer", "qa engineer", "qa analyst",
-    "qa automation", "test engineer", "sdet",
+    "automation engineer",
     "tech intern", "technology intern", "it intern",
     "software engineer", "software engineering",
     "systems engineer", "systems engineering",
@@ -649,6 +654,30 @@ _STAGE_FRENCH_RE = re.compile(
     r"(?:(?:un|de|du|en|le|la|au|bénévole|offre|recherche|cherche|propose)\s+stage\b"
     r"|\bstage\s+(?:en|de|du|chez|pour|rémunéré|développeur|developer|informatique|logiciel|étudiant|pratique))",
     re.IGNORECASE,
+)
+
+# Exclude QA/testing-focused titles without dropping normal software roles that
+# merely mention writing tests as part of the work.
+_EXCLUDED_ROLE_RES = (
+    re.compile(
+        r"\bq\.?\s*a\.?\s+(?:engineer|analyst|automation|tester|testing|intern|"
+        r"internship|co-?op|student|role|position)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:intern|internship|co-?op|student)\s+q\.?\s*a\.?\b", re.IGNORECASE),
+    re.compile(r"\bquality\s+assurance\b", re.IGNORECASE),
+    re.compile(r"\bquality\s+(?:engineer|analyst|intern|internship|co-?op|student)\b", re.IGNORECASE),
+    re.compile(r"\bautomation\s+tester\b", re.IGNORECASE),
+    re.compile(r"\bmanual\s+tester\b", re.IGNORECASE),
+    re.compile(r"\bsoftware\s+tester\b", re.IGNORECASE),
+    re.compile(r"\bsoftware\s+test\s+(?:intern|internship|co-?op|student|role|position)\b", re.IGNORECASE),
+    re.compile(r"\btest\s+engineer\b", re.IGNORECASE),
+    re.compile(r"\btest\s+automation\b", re.IGNORECASE),
+    re.compile(r"\btest\s+(?:intern|internship|co-?op|student|role|position)\b", re.IGNORECASE),
+    re.compile(r"\btester\s+(?:intern|internship|co-?op|student|role|position)\b", re.IGNORECASE),
+    re.compile(r"\btesting\s+(?:intern|internship|co-?op|student|role|position)\b", re.IGNORECASE),
+    re.compile(r"\b(?:intern|internship|co-?op|student)\s+(?:tester|testing)\b", re.IGNORECASE),
+    re.compile(r"\bsdet\b", re.IGNORECASE),
 )
 
 # The internship terms the user IS targeting: Fall 2026 and Winter 2027 starts.
@@ -817,6 +846,10 @@ def _body_mentions_software(body: str) -> bool:
     return any(kw in b for kw in SOFTWARE_KEYWORDS)
 
 
+def _mentions_excluded_role(text: str) -> bool:
+    return bool(text and any(rx.search(text) for rx in _EXCLUDED_ROLE_RES))
+
+
 def _mentions_location(text: str) -> bool:
     """True if text names a Montreal-area location or a remote/hybrid arrangement.
     Used to surface only listings the user can actually take (Montreal or remote)."""
@@ -833,7 +866,7 @@ def _has_software_internship_listing(sender: str, body: str) -> bool:
     "any intern keyword" test)."""
     for c in _split_aggregator_listings(sender, body):
         if (_body_mentions_internship(c) and _body_mentions_software(c)
-                and _mentions_location(c)):
+                and _mentions_location(c) and not _mentions_excluded_role(c)):
             return True
     return False
 
@@ -848,14 +881,18 @@ def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
     # though their bodies mention a role + location — never surface them.
     if _is_indeed_noise_sender(sender):
         return False
+    if _mentions_excluded_role(subject):
+        return False
     if _is_aggregator(sender):
         # Subject-only intern keyword is enough only if the subject itself also
         # names a software/tech role AND a Montreal/remote location; otherwise rely
         # on the per-chunk body listing check (which also requires location).
         if (_subject_mentions_internship(subject) and _body_mentions_software(subject)
-                and _mentions_location(subject)):
+                and _mentions_location(subject) and not _mentions_excluded_role(subject)):
             return True
         return _has_software_internship_listing(sender, body)
+    if _mentions_excluded_role(body):
+        return False
     has_software = _body_mentions_software(subject) or _body_mentions_software(body)
     if _subject_mentions_internship(subject) or _body_mentions_internship(body):
         return has_software
