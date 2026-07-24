@@ -222,7 +222,7 @@ Runs several targeted Gmail queries (internship/co-op/stage keywords, applicatio
 ### 2. Pre-filter (rule-based)
 Before hitting the LLM, emails with no internship signal are dropped:
 - Subject, body, or sender must contain an internship keyword (`intern`, `internship`, `co-op`, `coop`, `student`, `stagiaire`, or `stage` in French context only — see note below)
-- Emails where every intern listing in the body is a Fall 2026 / Automne 2026 / September 2026 position are excluded
+- Emails where every intern listing in the body is for a term other than Summer 2027 are excluded
 
 **Note on `stage`:** The word "stage" in English matches startup funding rounds ("Late Stage", "Early Stage"). The scanner only treats `stage` as an internship signal in the body when French words appear directly before or after it (e.g. `"un stage"`, `"bénévole stage"`, `"stage développeur"`). Subject-line matching is unaffected.
 
@@ -238,7 +238,7 @@ LLM results are validated:
 - Fields are mapped back to the original email (prevents hallucination of sender/date)
 - Companies not found in the email body are nulled out
 - Aggregator emails without any internship signal are dropped
-- Fall 2026 / September 2026 listings are excluded per-listing (a digest with one Summer co-op and one Fall co-op still passes)
+- Terms other than Summer 2027 are excluded per-listing (a digest with one Summer 2027 co-op and one Fall co-op still passes)
 - Duplicates from LLM hallucination are removed
 
 ### 5. Display
@@ -260,7 +260,7 @@ python compare.py --all        # include read emails
 
 Output sections:
 - **RULE-BASED** — emails kept by pure keyword matching on the full body (no LLM)
-- **DROPPED** — emails the rule filter excluded, with the reason (e.g. "all listings are Fall 2026")
+- **DROPPED** — emails the rule filter excluded, with the reason (e.g. "all listings are Fall 2027")
 - **LLM-BASED** — emails the LLM scanner surfaced after full analysis
 - **DIFF SUMMARY** — which emails each approach caught that the other missed
 
