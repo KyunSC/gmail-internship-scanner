@@ -657,12 +657,17 @@ _STAGE_FRENCH_RE = re.compile(
 _EXCLUDED_ROLE_RES = (
     re.compile(
         r"\bq\.?\s*a\.?\s+(?:engineer|analyst|automation|tester|testing|intern|"
-        r"internship|co-?op|student|role|position)\b",
+        r"internship|co-?op|student|role|position|technician|specialist|"
+        r"associate|assistant|lead|coordinator)\b",
         re.IGNORECASE,
     ),
     re.compile(r"\b(?:intern|internship|co-?op|student)\s+q\.?\s*a\.?\b", re.IGNORECASE),
     re.compile(r"\bquality\s+assurance\b", re.IGNORECASE),
-    re.compile(r"\bquality\s+(?:engineer|analyst|intern|internship|co-?op|student)\b", re.IGNORECASE),
+    re.compile(
+        r"\bquality\s+(?:engineer|analyst|intern|internship|co-?op|student|"
+        r"technician|specialist|associate|assistant|lead|coordinator|control)\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\bautomation\s+tester\b", re.IGNORECASE),
     re.compile(r"\bmanual\s+tester\b", re.IGNORECASE),
     re.compile(r"\bsoftware\s+tester\b", re.IGNORECASE),
@@ -710,6 +715,19 @@ _GLASSDOOR_LISTINGS_FOOT_RE = re.compile(
     r"See more jobs|Want more listings"
 )
 
+# The saved alert's name, as Glassdoor prints it in the header banner
+# ("Job alert: Full Stack Engineer"). The same string is echoed right after the
+# date line, where it would otherwise read as a job listing.
+_GLASSDOOR_ALERT_NAME_RE = re.compile(
+    r"Job alert:\s*(.+?)\s+Your job listings for", re.IGNORECASE
+)
+
+# The alert's location ("Mississauga, ON" / "Remote"), which trails the echoed
+# alert name. Bounded to a few words so it can't swallow the first listing.
+_GLASSDOOR_ECHO_LOCATION_RE = re.compile(
+    r"^\s*(?:[\w.'’&-]+(?:\s+[\w.'’&-]+){0,3},\s*[A-Z]{2}|remote)\b", re.IGNORECASE
+)
+
 
 def _clean_glassdoor_body(body: str) -> str:
     """Strip Glassdoor digest chrome before chunk analysis. Without this, the
@@ -719,17 +737,35 @@ def _clean_glassdoor_body(body: str) -> str:
     actual listings are all full-time. The footer also has "Create alert"
     CTAs like "web developer intern Create" that hit the same way.
 
-    Removes everything up to and including the first ★ after "Your job
-    listings for [date]" (which drops the alert-name echo and the first
-    listing's company chip, since Glassdoor puts the company+rating BEFORE
-    its ★ separator), and trims from "See more jobs" / "Want more listings"
-    onward."""
+    Cuts everything through "Your job listings for [date]", then removes just
+    the alert-name echo (and its trailing location) that follows. Cutting to
+    the first ★ instead — as this used to — also destroyed the FIRST listing,
+    because Glassdoor puts each company's rating chip BEFORE its ★ separator,
+    so the headline listing sits between the date line and that first ★. That
+    listing is the one Glassdoor names in "X is hiring for Y" subjects, which
+    carry no location and therefore can't pass on the subject alone — so the
+    email's only real listing was being thrown away before it was ever read.
+
+    Falls back to the old star cut when the alert name can't be recovered,
+    since leaving an unrecognized echo in place would reintroduce the false
+    keywords this function exists to remove. Trims from "See more jobs" /
+    "Want more listings" onward either way."""
     m = _GLASSDOOR_LISTINGS_HEAD_RE.search(body)
     if m:
+        m_alert = _GLASSDOOR_ALERT_NAME_RE.search(body)
+        alert = m_alert.group(1).strip() if m_alert else ""
         body = body[m.end():]
-        star = body.find("★")
-        if star >= 0:
-            body = body[star + 1:]
+        rest = body.lstrip()
+        if alert and rest[:len(alert)].lower() == alert.lower():
+            rest = rest[len(alert):]
+            loc = _GLASSDOOR_ECHO_LOCATION_RE.match(rest)
+            if loc:
+                rest = rest[loc.end():]
+            body = rest
+        else:
+            star = body.find("★")
+            if star >= 0:
+                body = body[star + 1:]
     m2 = _GLASSDOOR_LISTINGS_FOOT_RE.search(body)
     if m2:
         body = body[:m2.start()]
@@ -761,18 +797,44 @@ def _is_off_target_term(chunk: str) -> bool:
     return bool(SEASON_TERM_REGEX.search(chunk)) and not TARGET_TERM_REGEX.search(chunk)
 
 
+def _season_checked_chunks(sender: str, body: str) -> list[str]:
+    """The listings the off-target-season filter judges an email by.
+
+    For aggregator digests these are exactly the listings that QUALIFY the
+    email — the same intern + software + location + not-excluded test
+    _has_software_internship_listing surfaces it on. Season-checking every
+    chunk with an internship keyword instead let the two filters disagree about
+    which listing mattered: a digest could be surfaced on an off-target listing
+    (e.g. a Fall 2026 front-end role) and then rescued from this filter by an
+    unrelated undated one (a QA technician posting in another province), so
+    neither listing was one the user wanted.
+
+    Non-aggregator bodies are deliberately not location-filtered (see
+    _mentions_location), so they fall back to a plain internship-keyword test
+    over the whole body.
+
+    Either way the test is _body_mentions_internship, never the subject
+    variant: that one also matches a bare "stage", which is a company-maturity
+    label in these digests ("Cohere · Late Stage", "TechInsights · Growth
+    Stage"), not an internship. Counting those made almost every chunk look
+    like an intern listing, and one undated impostor was enough to keep an
+    all-off-target digest alive."""
+    chunks = _split_aggregator_listings(sender, body)
+    if _is_aggregator(sender):
+        return [c for c in chunks if _is_qualifying_listing(c)]
+    return [c for c in chunks if _body_mentions_internship(c)]
+
+
 def _all_intern_listings_excluded(sender: str, body: str) -> bool:
-    """True if every chunk containing an internship keyword names an off-target
-    term (a season other than Summer 2027). False if any intern
-    listing targets Summer 2027 or states no season at all, or if no
-    chunk has an intern keyword (in which case the filter shouldn't fire)."""
-    intern_chunks = [
-        c for c in _split_aggregator_listings(sender, body)
-        if _body_mentions_internship(c) or _subject_mentions_internship(c)
-    ]
-    if not intern_chunks:
+    """True if every listing this email qualifies on names an off-target term
+    (a season other than Summer 2027). False if any such listing targets
+    Summer 2027 or states no season at all, or if there are no qualifying
+    listings (in which case the filter shouldn't fire — the no-signal check
+    owns that case)."""
+    chunks = _season_checked_chunks(sender, body)
+    if not chunks:
         return False
-    return all(_is_off_target_term(c) for c in intern_chunks)
+    return all(_is_off_target_term(c) for c in chunks)
 
 
 RECRUITER_SENDER_HINTS = (
@@ -852,17 +914,22 @@ def _mentions_location(text: str) -> bool:
     )
 
 
+def _is_qualifying_listing(chunk: str) -> bool:
+    """True if a single listing is one the user actually wants: an internship,
+    in software/tech, at an acceptable location, and not an excluded (QA /
+    testing) role. Shared by the surfacing check and the season filter so both
+    judge an email by the same listing."""
+    return (_body_mentions_internship(chunk) and _body_mentions_software(chunk)
+            and _mentions_location(chunk) and not _mentions_excluded_role(chunk))
+
+
 def _has_software_internship_listing(sender: str, body: str) -> bool:
     """True iff at least one body chunk contains an internship keyword, a
     software/tech keyword, AND an acceptable listing location. For aggregators
     with a known digest splitter this is per-listing; without one it falls back to
     a whole-body co-occurrence check (still strictly stricter than the previous
     "any intern keyword" test)."""
-    for c in _split_aggregator_listings(sender, body):
-        if (_body_mentions_internship(c) and _body_mentions_software(c)
-                and _mentions_location(c) and not _mentions_excluded_role(c)):
-            return True
-    return False
+    return any(_is_qualifying_listing(c) for c in _split_aggregator_listings(sender, body))
 
 
 def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
@@ -875,9 +942,15 @@ def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
     # though their bodies mention a role + location — never surface them.
     if _is_indeed_noise_sender(sender):
         return False
-    if _mentions_excluded_role(subject):
-        return False
     if _is_aggregator(sender):
+        # Excluded (QA/testing) roles are filtered PER LISTING here, never on the
+        # subject. A digest's subject names just one of its listings, so vetoing
+        # the whole email on it threw away the others — a digest titled "Sibelius
+        # - Software Test Engineer at Avid Technology and 4 more jobs in Montreal"
+        # was discarded along with the two Summer 2027 Montreal internships
+        # inside it. _is_qualifying_listing still keeps any QA listing from
+        # qualifying an email on its own; it just no longer vetoes its neighbours.
+        #
         # Subject-only intern keyword is enough only if the subject itself also
         # names a software/tech role AND an acceptable listing location; otherwise rely
         # on the per-chunk body listing check (which also requires location).
@@ -885,6 +958,8 @@ def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
                 and _mentions_location(subject) and not _mentions_excluded_role(subject)):
             return True
         return _has_software_internship_listing(sender, body)
+    if _mentions_excluded_role(subject):
+        return False
     if _mentions_excluded_role(body):
         return False
     has_software = _body_mentions_software(subject) or _body_mentions_software(body)
