@@ -74,6 +74,10 @@ def get_gmail_service(write_access: bool = False):
 
     write_access=True requests the gmail.modify scope so we can mark emails as
     read. If the cached token only has readonly, we force a re-auth.
+
+    A token that already carries modify is reused as-is for read-only runs
+    rather than being reissued at readonly — see the comment below. That way one
+    consent covers every later run of every script, in either direction.
     """
     needed = [SCOPE_MODIFY] if write_access else [SCOPE_READONLY]
     creds = None
@@ -86,7 +90,17 @@ def get_gmail_service(write_access: bool = False):
             # Token was issued under readonly only — force a fresh auth flow.
             creds = None
         else:
-            creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), needed)
+            # Load under the scopes actually GRANTED, not the narrower set this
+            # run happens to need. Passing `needed` rewrites creds.scopes, and
+            # if the token then needs a refresh it gets persisted back below at
+            # that narrower scope — silently demoting a modify token to readonly.
+            # A single read-only run (compare.py without --apply, show_bodies.py)
+            # was therefore enough to force the next --apply through the consent
+            # screen again. modify is a superset of readonly, so the granted
+            # token serves both; only clean_inbox(apply=True) ever writes.
+            creds = Credentials.from_authorized_user_file(
+                str(TOKEN_PATH), sorted(granted) or needed
+            )
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
