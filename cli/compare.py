@@ -35,7 +35,7 @@ def rule_based_filter(emails: list[dict]) -> tuple[list[dict], list[dict]]:
         if not _has_internship_signal(subject, body, sender):
             dropped.append({**e, "_drop_reason": "no internship signal"})
         elif _all_intern_listings_excluded(sender, body):
-            dropped.append({**e, "_drop_reason": "all listings off-target (not Summer 2027)"})
+            dropped.append({**e, "_drop_reason": "no listing explicitly says Summer 2027"})
         else:
             kept.append(e)
     return kept, dropped
@@ -169,7 +169,10 @@ def main():
     # ── Save cache ───────────────────────────────────────────────────────────
     # Merge this run's emails + LLM-surfaced ids into the accumulated cache so
     # the next compare run (and scanner.py) skips these emails.
-    cache = save_scan_cache(emails, llm_results)
+    # Persist the union from both pipelines. A rule-only result is deliberately
+    # kept unread by cleanup, so it must also remain in the cached keep-set on
+    # later runs where there are no fresh emails to analyze.
+    cache = save_scan_cache(emails, [*llm_results, *rule_kept])
 
     # ── Cleanup ─────────────────────────────────────────────────────────────
     # Mark aggregator emails as read when BOTH pipelines agreed they're not

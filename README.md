@@ -222,7 +222,7 @@ Runs several targeted Gmail queries (internship/co-op/stage keywords, applicatio
 ### 2. Pre-filter (rule-based)
 Before hitting the LLM, emails with no internship signal are dropped:
 - Subject, body, or sender must contain an internship keyword (`intern`, `internship`, `co-op`, `coop`, `student`, `stagiaire`, or `stage` in French context only — see note below)
-- Emails where every intern listing in the body is for a term other than Summer 2027 are excluded
+- Only qualifying listings that explicitly say Summer 2027 are kept; undated and other-term listings are excluded
 
 **Note on `stage`:** The word "stage" in English matches startup funding rounds ("Late Stage", "Early Stage"). The scanner only treats `stage` as an internship signal in the body when French words appear directly before or after it (e.g. `"un stage"`, `"bénévole stage"`, `"stage développeur"`). Subject-line matching is unaffected.
 
@@ -238,7 +238,7 @@ LLM results are validated:
 - Fields are mapped back to the original email (prevents hallucination of sender/date)
 - Companies not found in the email body are nulled out
 - Aggregator emails without any internship signal are dropped
-- Terms other than Summer 2027 are excluded per-listing (a digest with one Summer 2027 co-op and one Fall co-op still passes)
+- Listings without an explicit Summer 2027 term are excluded per-listing (a digest with one Summer 2027 co-op and one Fall co-op still passes)
 - Duplicates from LLM hallucination are removed
 
 ### 5. Display

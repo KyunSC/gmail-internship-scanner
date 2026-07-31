@@ -697,7 +697,7 @@ _EXCLUDED_ROLE_RES = (
 
 # The internship term the user IS targeting: Summer 2027 starts.
 # Covers French (été) and the May month forms aggregators use, plus the short
-# season code S2027. A listing matching this is always kept.
+# season code S2027. A qualifying listing must match this to be kept.
 TARGET_TERM_REGEX = re.compile(
     r"\b(summer|[ée]t[ée])\b.{0,20}\b2027\b"
     r"|\b2027\b.{0,20}\b(summer|[ée]t[ée])\b"
@@ -706,19 +706,6 @@ TARGET_TERM_REGEX = re.compile(
     r"|\b[s][-\s]?2027\b",
     re.IGNORECASE,
 )
-
-# Any explicit season/term + year mention. Paired with TARGET_TERM_REGEX to tell
-# an OFF-TARGET term (e.g. Summer 2026, Fall 2027) apart from a listing that
-# names no season at all. Off-target listings are dropped; no-season listings are
-# kept (lenient — we'd rather surface an undated posting than miss one).
-SEASON_TERM_REGEX = re.compile(
-    r"\b(?:fall|automne|spring|printemps|summer|[ée]t[ée]|winter|hiver)\b.{0,20}\b20\d\d\b"
-    r"|\b20\d\d\b.{0,20}\b(?:fall|automne|spring|printemps|summer|[ée]t[ée]|winter|hiver)\b"
-    r"|\b(?:jan(?:\.|uary|vier)?|sept(?:\.|ember|embre)?|may|mai)\s*\.?\s*20\d\d\b"
-    r"|\b[fwas][-\s]?20\d\d\b",
-    re.IGNORECASE,
-)
-
 
 _GLASSDOOR_LISTINGS_HEAD_RE = re.compile(
     r"Your job listings for\s+\w+\s+\d+,\s+\d{4}",
@@ -805,10 +792,8 @@ def _split_aggregator_listings(sender: str, body: str) -> list[str]:
 
 
 def _is_off_target_term(chunk: str) -> bool:
-    """True if a listing names an explicit season/term other than the ones the
-    user targets (Summer 2027). A listing with no recognizable
-    season is NOT off-target — it's kept (lenient)."""
-    return bool(SEASON_TERM_REGEX.search(chunk)) and not TARGET_TERM_REGEX.search(chunk)
+    """True unless the listing explicitly names the target term (Summer 2027)."""
+    return not TARGET_TERM_REGEX.search(chunk)
 
 
 def _season_checked_chunks(sender: str, body: str) -> list[str]:
@@ -841,13 +826,11 @@ def _season_checked_chunks(sender: str, body: str) -> list[str]:
 
 def _all_intern_listings_excluded(sender: str, body: str) -> bool:
     """True if every listing this email qualifies on names an off-target term
-    (a season other than Summer 2027). False if any such listing targets
-    Summer 2027 or states no season at all, or if there are no qualifying
-    listings (in which case the filter shouldn't fire — the no-signal check
-    owns that case)."""
+    (anything other than an explicit Summer 2027). False only if at least one
+    qualifying listing targets Summer 2027."""
     chunks = _season_checked_chunks(sender, body)
     if not chunks:
-        return False
+        return True
     return all(_is_off_target_term(c) for c in chunks)
 
 
@@ -1001,15 +984,22 @@ def analyze_with_ollama(
     if not emails:
         return []
 
-    # Pre-filter: only send emails that have an internship signal in subject, body,
-    # or sender before hitting the LLM.
-    filtered_in = [
+    # Pre-filter: only send emails that have an internship signal and an explicit
+    # Summer 2027 qualifying listing before hitting the LLM.
+    signaled = [
         e for e in emails
         if _has_internship_signal(e.get("subject", ""), e.get("body", ""), e.get("from", ""))
     ]
-    dropped_pre = len(emails) - len(filtered_in)
-    if dropped_pre:
-        print(f"  Pre-filtered {dropped_pre} email(s) with no internship signal")
+    dropped_no_signal = len(emails) - len(signaled)
+    filtered_in = [
+        e for e in signaled
+        if not _all_intern_listings_excluded(e.get("from", ""), e.get("body", ""))
+    ]
+    dropped_term = len(signaled) - len(filtered_in)
+    if dropped_no_signal:
+        print(f"  Pre-filtered {dropped_no_signal} email(s) with no internship signal")
+    if dropped_term:
+        print(f"  Pre-filtered {dropped_term} email(s) without a Summer 2027 listing")
     # Stable batching: sort by Gmail message ID so batch composition doesn't shift
     # when a new email arrives between runs (Gmail returns most-recent-first, which
     # shifts every existing email down by one when something new lands).
@@ -1121,8 +1111,8 @@ def analyze_with_ollama(
         # Per-listing off-target-term exclusion (body only — subject is
         # intentionally not checked). For digest aggregators the body is split
         # into individual job listings; we drop the email only if EVERY intern
-        # listing names a season other than Summer 2027. A mixed
-        # digest with one on-target (or undated) intern still passes.
+        # listing does not explicitly name Summer 2027. A mixed digest with one
+        # on-target intern still passes.
         body = original.get("body", "")
         if _all_intern_listings_excluded(sender, body):
             dropped_term += 1
@@ -1141,7 +1131,7 @@ def analyze_with_ollama(
     if dropped_aggregator:
         print(f"  Filtered out {dropped_aggregator} aggregator email(s) without internship keywords")
     if dropped_term:
-        print(f"  Filtered out {dropped_term} email(s) whose listings are all off-target (not Summer 2027)")
+        print(f"  Filtered out {dropped_term} email(s) without a Summer 2027 listing")
     if dropped_dup:
         print(f"  Filtered out {dropped_dup} duplicate email(s) (LLM hallucination)")
     if dropped_unmatched:
@@ -1185,7 +1175,7 @@ def rule_based_analyze(emails: list[dict]) -> list[dict]:
     if dropped_no_signal:
         print(f"  Dropped {dropped_no_signal} email(s) with no internship signal")
     if dropped_term:
-        print(f"  Dropped {dropped_term} email(s) whose listings are all off-target (not Summer 2027)")
+        print(f"  Dropped {dropped_term} email(s) without a Summer 2027 listing")
     return out
 
 
@@ -1430,7 +1420,11 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
         # its per-query result cap (30) cut them off, while still dropping
         # non-tech internships (accounting, marketing) that the scanner now
         # filters out. Subject-only check — we don't fetch the body here.
-        if _subject_mentions_internship(subject) and _body_mentions_software(subject):
+        if (
+            _subject_mentions_internship(subject)
+            and _body_mentions_software(subject)
+            and TARGET_TERM_REGEX.search(subject)
+        ):
             kept_subject_safety += 1
             continue
         to_mark.append({"id": meta["id"], "from": sender_raw, "subject": subject, "date": date_raw})
