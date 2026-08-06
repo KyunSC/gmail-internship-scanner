@@ -134,8 +134,14 @@ def main():
         print()
 
     # ── LLM-based (the actual scanner pipeline) ─────────────────────────────
+    # prefilter=False is what makes this a real comparison. scanner.py runs the
+    # same keyword/term rules before the LLM to save model calls, which would make
+    # the LLM arm a strict subset of the rule arm here — "LLM caught, rule did NOT"
+    # could never be non-zero, and the keep-set union below would collapse to
+    # rule_ids. Sending every email to the LLM costs more but lets the two arms
+    # actually disagree in both directions.
     print(f"\n{BOLD}Running LLM scanner pipeline…{RESET}")
-    llm_results = analyze_with_ollama(emails)
+    llm_results = analyze_with_ollama(emails, prefilter=False)
     llm_ids = {r.get("id") for r in llm_results if r.get("id")}
 
     print_email_list(llm_results, "LLM-BASED (scanner pipeline)", color="\033[32m")

@@ -979,27 +979,37 @@ LLM_PASS_TEMPERATURES = (0.0, 0.5)
 def analyze_with_ollama(
     emails: list[dict],
     prompt_template: str = PROMPT_DEFAULT,
+    prefilter: bool = True,
 ) -> list[dict]:
-    """Send email metadata to Ollama for classification and summarization in batches."""
+    """Send email metadata to Ollama for classification and summarization in batches.
+
+    prefilter=True runs the keyword/term rules before the LLM, so only plausible
+    emails cost a model call — the right trade-off for a normal scan. Pass
+    prefilter=False to send every email to the LLM regardless of what the rules
+    think; compare.py needs this so the LLM arm is genuinely independent of the
+    rule arm rather than a subset of it.
+    """
     if not emails:
         return []
 
-    # Pre-filter: only send emails that have an internship signal and an explicit
-    # Summer 2027 qualifying listing before hitting the LLM.
-    signaled = [
-        e for e in emails
-        if _has_internship_signal(e.get("subject", ""), e.get("body", ""), e.get("from", ""))
-    ]
-    dropped_no_signal = len(emails) - len(signaled)
-    filtered_in = [
-        e for e in signaled
-        if not _all_intern_listings_excluded(e.get("from", ""), e.get("body", ""))
-    ]
-    dropped_term = len(signaled) - len(filtered_in)
-    if dropped_no_signal:
-        print(f"  Pre-filtered {dropped_no_signal} email(s) with no internship signal")
-    if dropped_term:
-        print(f"  Pre-filtered {dropped_term} email(s) without a Summer 2027 listing")
+    if prefilter:
+        signaled = [
+            e for e in emails
+            if _has_internship_signal(e.get("subject", ""), e.get("body", ""), e.get("from", ""))
+        ]
+        dropped_no_signal = len(emails) - len(signaled)
+        filtered_in = [
+            e for e in signaled
+            if not _all_intern_listings_excluded(e.get("from", ""), e.get("body", ""))
+        ]
+        dropped_term = len(signaled) - len(filtered_in)
+        if dropped_no_signal:
+            print(f"  Pre-filtered {dropped_no_signal} email(s) with no internship signal")
+        if dropped_term:
+            print(f"  Pre-filtered {dropped_term} email(s) without a Summer 2027 listing")
+    else:
+        filtered_in = emails
+        print(f"  Pre-filter disabled — sending all {len(emails)} email(s) to the LLM")
     # Stable batching: sort by Gmail message ID so batch composition doesn't shift
     # when a new email arrives between runs (Gmail returns most-recent-first, which
     # shifts every existing email down by one when something new lands).
