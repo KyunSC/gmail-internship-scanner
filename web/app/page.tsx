@@ -9,6 +9,8 @@ import {
   detectCapability,
   recommendModel,
   MODEL_OPTIONS,
+  MOBILE_MODEL_ID,
+  DEFAULT_WEBLLM_MODEL,
   type Capability,
   type LlmBackend,
   type ModelProgress,
@@ -63,7 +65,7 @@ export default function Dashboard() {
   // LLM backend
   const [backend, setBackend] = useState<LlmBackend>("webllm");
   const [capability, setCapability] = useState<Capability | null>(null);
-  const [webllmModel, setWebllmModel] = useState(MODEL_OPTIONS[1].id);
+  const [webllmModel, setWebllmModel] = useState(DEFAULT_WEBLLM_MODEL);
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
   const [ollamaModel, setOllamaModel] = useState("qwen3.5:9b");
 
@@ -103,7 +105,13 @@ export default function Dashboard() {
       .then((cap) => {
         setCapability(cap);
         setWebllmModel(recommendModel(cap));
-        if (!cap.webgpu) setBackend("ollama");
+        if (!cap.webgpu) {
+          // Ollama cannot run on iOS/Android, so falling back to it there strands
+          // the user on a backend the device has no way to provide. Rule-based
+          // Fast mode is the only path that actually works on a phone.
+          if (cap.mobile) setFast(true);
+          else setBackend("ollama");
+        }
       })
       .catch(() => undefined);
   }, [refreshCache]);
@@ -174,6 +182,9 @@ export default function Dashboard() {
           webllmModel,
           ollamaUrl,
           ollamaModel,
+          // Phones can't hold the full classification prompt in context; rules
+          // take over relevance there and the model only extracts fields.
+          lowMemory: backend === "webllm" && (capability?.mobile ?? false),
           onLog: appendLog,
           onModelProgress: setModelProgress,
           signal: ac.signal,
@@ -214,7 +225,7 @@ export default function Dashboard() {
     }
   }, [
     busy, email, keyword, days, maxEmails, includeRead, fast, rescan, backend,
-    webllmModel, ollamaUrl, ollamaModel, cache, appendLog, refreshCache,
+    webllmModel, ollamaUrl, ollamaModel, cache, appendLog, refreshCache, capability,
   ]);
 
   const onCancel = useCallback(() => abortRef.current?.abort(), []);
@@ -326,6 +337,11 @@ export default function Dashboard() {
                       {capability.deviceMemoryGB ? `~${capability.deviceMemoryGB}GB RAM · ` : ""}
                       {capability.cores ? `${capability.cores} cores` : ""}
                     </>
+                  ) : capability.mobile ? (
+                    <span className="text-amber-300">
+                      WebGPU not available on this device — Ollama can&apos;t run on a phone either, so
+                      Fast mode (rule-based, no LLM) has been turned on for you.
+                    </span>
                   ) : (
                     <span className="text-amber-300">
                       WebGPU not available here — use Chrome/Edge or Safari 18+, or switch to Local Ollama.
@@ -342,6 +358,12 @@ export default function Dashboard() {
                   ))}
                 </select>
               </Field>
+              {capability?.mobile && webllmModel !== MOBILE_MODEL_ID && (
+                <p className="text-[11px] text-amber-300">
+                  Phones and tablets kill a tab that goes much past ~1 GB. Anything above the 1B model
+                  will likely reload the page mid-scan — switch back if that happens, or use Fast mode.
+                </p>
+              )}
               {modelProgress && modelProgress.progress < 1 && (
                 <div>
                   <div className="text-[11px] text-[color:var(--color-muted)] mb-1 truncate">{modelProgress.text}</div>

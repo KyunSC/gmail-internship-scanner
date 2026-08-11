@@ -189,6 +189,24 @@ function allInternListingsExcluded(sender: string, body: string): boolean {
   return internChunks.every((c) => EXCLUDE_TERM_REGEX.test(c));
 }
 
+/**
+ * Best excerpt to hand a small model for field extraction under a tight context
+ * budget. Aggregator digests bury the qualifying listing deep in the body, so
+ * head-truncating them would cut exactly the part worth reading — pick the
+ * matching listing chunk instead.
+ */
+export function relevantExcerpt(sender: string, body: string, maxChars: number): string {
+  const b = body || "";
+  let chosen = b;
+  if (isAggregator(sender)) {
+    const hit = splitAggregatorListings(sender, b).find(
+      (c) => bodyMentionsInternship(c) && bodyMentionsSoftware(c) && mentionsLocation(c),
+    );
+    if (hit) chosen = hit;
+  }
+  return chosen.length > maxChars ? `${chosen.slice(0, maxChars)}…` : chosen;
+}
+
 // ── Result coercion + post-filter (mirror _validate_result + analyze tail) ───
 const VALID_CATEGORIES = new Set(["internship", "recruiter", "confirmation", "reply", "status"]);
 const VALID_PRIORITIES = new Set(["high", "medium", "low"]);

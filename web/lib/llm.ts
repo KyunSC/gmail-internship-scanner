@@ -11,15 +11,26 @@ import {
   hasInternshipSignal,
   postFilterResults,
   coerceResult,
+  ruleBasedAnalyze,
+  relevantExcerpt,
   type ResultItem,
 } from "@/lib/filter";
 
 export type LlmBackend = "webllm" | "ollama";
 
 const LLM_PASS_TEMPERATURES = [0.0, 0.5]; // deterministic baseline + diversity pass
+const MAX_TOKENS = 4096;
+
+// Low-memory (phone) profile. A 1B model can't follow the full classification
+// prompt, and a 4096-token context blows the mobile memory budget on KV cache
+// alone — so rules keep ownership of relevance and the model only fills in the
+// two fields rules can't produce. Short prompt, small context, single pass.
+const LOW_MEM_CTX = 1024;
+const LOW_MEM_MAX_TOKENS = 192;
+const LOW_MEM_BODY_CHARS = 1200;
 const DEFAULT_OLLAMA_URL = "http://localhost:11434";
 const DEFAULT_OLLAMA_MODEL = "qwen3.5:9b";
-const DEFAULT_WEBLLM_MODEL = "Qwen2.5-3B-Instruct-q4f16_1-MLC";
+export const DEFAULT_WEBLLM_MODEL = "Qwen2.5-3B-Instruct-q4f16_1-MLC";
 
 // ── Prompt (verbatim from PROMPT_DEFAULT) ────────────────────────────────────
 function buildPrompt(emailText: string): string {
@@ -94,6 +105,27 @@ If NO emails in this batch are relevant, return: {"results": []}
 
 Emails:
 ${emailText}`;
+}
+
+/**
+ * Low-memory prompt: relevance is already decided by the rule filter, so this
+ * asks only for the two fields rules cannot produce. Kept deliberately short —
+ * every token here competes with the KV cache for the mobile memory budget.
+ */
+function buildExtractPrompt(e: GmailMessage): string {
+  const body = relevantExcerpt(e.from ?? "", e.body ?? "", LOW_MEM_BODY_CHARS);
+  return `Extract two fields from this internship email. Reply with JSON only, no other text.
+
+{"company": "<name of the hiring company, copied exactly from the text below, or null>", "summary": "<one sentence, at most 20 words, describing this email>"}
+
+Rules:
+- Copy the company name character-for-character from the text. Never invent one.
+- If no company name appears in the text, use null.
+- The summary must describe THIS email only.
+
+Subject: ${sanitizeForPrompt(e.subject ?? "")}
+From: ${sanitizeForPrompt(e.from ?? "")}
+Body: ${sanitizeForPrompt(body)}`;
 }
 
 function sanitizeForPrompt(s: string): string {
@@ -190,6 +222,7 @@ async function ollamaGenerate(
   model: string,
   prompt: string,
   temperature: number,
+  numPredict: number,
 ): Promise<string> {
   const res = await fetch(`${url}/api/generate`, {
     method: "POST",
@@ -200,7 +233,7 @@ async function ollamaGenerate(
       stream: false,
       format: "json",
       think: false, // Qwen3 family: route content out of the <think> block
-      options: { temperature, num_predict: 4096, num_ctx: estimateCtx(prompt, 4096) },
+      options: { temperature, num_predict: numPredict, num_ctx: estimateCtx(prompt, numPredict) },
     }),
   });
   if (!res.ok) throw new Error(`Ollama request failed (${res.status})`);
@@ -219,22 +252,30 @@ type WebllmEngine = {
 };
 
 let engine: WebllmEngine | null = null;
-let engineModel = "";
+let engineKey = "";
 
 export type ModelProgress = { text: string; progress: number };
 
 async function getWebllmEngine(
   modelId: string,
   onProgress?: (p: ModelProgress) => void,
+  ctxSize?: number,
 ): Promise<WebllmEngine> {
-  if (engine && engineModel === modelId) return engine;
+  // Context size is baked in at load time, so it belongs in the cache key —
+  // reusing a 4096-ctx engine for the low-memory path would defeat the point.
+  const key = `${modelId}|${ctxSize ?? "default"}`;
+  if (engine && engineKey === key) return engine;
   const webllm = await import("@mlc-ai/web-llm");
   if (engine?.unload) await engine.unload();
-  engine = (await webllm.CreateMLCEngine(modelId, {
-    initProgressCallback: (p: { text: string; progress: number }) =>
-      onProgress?.({ text: p.text, progress: p.progress }),
-  })) as unknown as WebllmEngine;
-  engineModel = modelId;
+  engine = (await webllm.CreateMLCEngine(
+    modelId,
+    {
+      initProgressCallback: (p: { text: string; progress: number }) =>
+        onProgress?.({ text: p.text, progress: p.progress }),
+    },
+    ctxSize ? { context_window_size: ctxSize } : undefined,
+  )) as unknown as WebllmEngine;
+  engineKey = key;
   return engine;
 }
 
@@ -242,11 +283,12 @@ async function webllmGenerate(
   eng: WebllmEngine,
   prompt: string,
   temperature: number,
+  maxTokens: number,
 ): Promise<string> {
   const resp = await eng.chat.completions.create({
     messages: [{ role: "user", content: prompt }],
     temperature,
-    max_tokens: 4096,
+    max_tokens: maxTokens,
     response_format: { type: "json_object" },
   });
   return (resp.choices[0]?.message?.content ?? "").trim();
@@ -255,16 +297,30 @@ async function webllmGenerate(
 // ── Capability detection (answers "what can this PC run?") ───────────────────
 export type Capability = {
   webgpu: boolean;
+  mobile: boolean;
   deviceMemoryGB?: number;
   cores?: number;
   gpuVendor?: string;
   maxBufferMB?: number;
 };
 
+/**
+ * iOS/Android browsers hard-kill a tab that exceeds a per-tab memory ceiling far
+ * below desktop limits, regardless of what the GPU adapter advertises — so this
+ * has to gate model choice independently of maxBufferSize.
+ */
+function detectMobile(): boolean {
+  if (typeof navigator === "undefined") return false;
+  // iPadOS 13+ reports platform "MacIntel"; touch points disambiguate it from a Mac.
+  const iPadOS = navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
+  return iPadOS || /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+}
+
 export async function detectCapability(): Promise<Capability> {
   const nav = navigator as Navigator & { deviceMemory?: number; gpu?: unknown };
   const cap: Capability = {
     webgpu: typeof nav.gpu !== "undefined",
+    mobile: detectMobile(),
     deviceMemoryGB: nav.deviceMemory,
     cores: navigator.hardwareConcurrency,
   };
@@ -288,19 +344,30 @@ export async function detectCapability(): Promise<Capability> {
   return cap;
 }
 
-export type ModelOption = { id: string; label: string };
+export type ModelOption = { id: string; label: string; vramMB: number };
 
-// Curated subset of @mlc-ai/web-llm prebuilt models (ids verified present).
+// Curated subset of @mlc-ai/web-llm prebuilt models, ascending by cost. `vramMB`
+// is the model's declared `vram_required_MB` from prebuiltAppConfig — not an
+// estimate — so the labels and the mobile budget below track the real numbers.
 export const MODEL_OPTIONS: ModelOption[] = [
-  { id: "Qwen2.5-1.5B-Instruct-q4f16_1-MLC", label: "Qwen2.5 1.5B — fastest, lightest (~1.2 GB)" },
-  { id: "Qwen2.5-3B-Instruct-q4f16_1-MLC", label: "Qwen2.5 3B — balanced (~2.2 GB)" },
-  { id: "Llama-3.2-3B-Instruct-q4f16_1-MLC", label: "Llama 3.2 3B — balanced (~2.3 GB)" },
-  { id: "Qwen2.5-7B-Instruct-q4f16_1-MLC", label: "Qwen2.5 7B — best quality (~4.5 GB)" },
-  { id: "Llama-3.1-8B-Instruct-q4f16_1-MLC", label: "Llama 3.1 8B — best quality (~4.6 GB)" },
+  { id: "Llama-3.2-1B-Instruct-q4f16_1-MLC", label: "Llama 3.2 1B — mobile / low memory (0.9 GB)", vramMB: 879 },
+  { id: "Qwen2.5-1.5B-Instruct-q4f16_1-MLC", label: "Qwen2.5 1.5B — fastest, lightest (1.6 GB)", vramMB: 1630 },
+  { id: "Llama-3.2-3B-Instruct-q4f16_1-MLC", label: "Llama 3.2 3B — balanced (2.3 GB)", vramMB: 2264 },
+  { id: "Qwen2.5-3B-Instruct-q4f16_1-MLC", label: "Qwen2.5 3B — balanced (2.5 GB)", vramMB: 2505 },
+  { id: "Llama-3.1-8B-Instruct-q4f16_1-MLC", label: "Llama 3.1 8B — best quality (5.0 GB)", vramMB: 5001 },
+  { id: "Qwen2.5-7B-Instruct-q4f16_1-MLC", label: "Qwen2.5 7B — best quality (5.1 GB)", vramMB: 5107 },
 ];
+
+// Largest model that has a realistic chance of surviving a mobile tab.
+export const MOBILE_MODEL_ID = "Llama-3.2-1B-Instruct-q4f16_1-MLC";
 
 /** Pick a sensible default model id given detected capability. */
 export function recommendModel(cap: Capability): string {
+  // Must come first: `deviceMemory` is Chromium-only (undefined in all Safari),
+  // and a phone's advertised maxBufferSize can clear 4 GB — so the desktop
+  // tiering below would otherwise hand an iPhone the 5.1 GB model.
+  if (cap.mobile) return MOBILE_MODEL_ID;
+
   const bufOk7b = (cap.maxBufferMB ?? 0) >= 4000;
   const memOk7b = (cap.deviceMemoryGB ?? 0) >= 8;
   if (bufOk7b || memOk7b) return "Qwen2.5-7B-Instruct-q4f16_1-MLC";
@@ -316,26 +383,76 @@ export type AnalyzeOptions = {
   webllmModel?: string;
   ollamaUrl?: string;
   ollamaModel?: string;
+  /** Phone/tablet profile: rules classify, the model only extracts fields. */
+  lowMemory?: boolean;
   onLog?: (line: string) => void;
   onProgress?: (fraction: number) => void;
   onModelProgress?: (p: ModelProgress) => void;
   signal?: AbortSignal;
 };
 
-async function makeGenerate(
-  opts: AnalyzeOptions,
-): Promise<(prompt: string, temperature: number) => Promise<string>> {
+type GenerateFn = (prompt: string, temperature: number, maxTokens: number) => Promise<string>;
+
+async function makeGenerate(opts: AnalyzeOptions): Promise<GenerateFn> {
   if (opts.backend === "ollama") {
     const url = opts.ollamaUrl || DEFAULT_OLLAMA_URL;
     const model = opts.ollamaModel || DEFAULT_OLLAMA_MODEL;
     opts.onLog?.(`Checking Ollama at ${url} (model ${model})…`);
     await checkOllama(url, model);
-    return (prompt, temp) => ollamaGenerate(url, model, prompt, temp);
+    return (prompt, temp, maxTokens) => ollamaGenerate(url, model, prompt, temp, maxTokens);
   }
   const model = opts.webllmModel || DEFAULT_WEBLLM_MODEL;
   opts.onLog?.(`Loading WebLLM model ${model} (first run downloads it)…`);
-  const eng = await getWebllmEngine(model, opts.onModelProgress);
-  return (prompt, temp) => webllmGenerate(eng, prompt, temp);
+  const eng = await getWebllmEngine(
+    model,
+    opts.onModelProgress,
+    opts.lowMemory ? LOW_MEM_CTX : undefined,
+  );
+  return (prompt, temp, maxTokens) => webllmGenerate(eng, prompt, temp, maxTokens);
+}
+
+/**
+ * Low-memory pipeline: the rule filter owns relevance (same gate the full path
+ * uses as its pre-filter), and the model runs one short extraction per kept
+ * email to fill in company + summary. Extraction failures degrade to the plain
+ * rule-based result rather than dropping the email.
+ */
+async function analyzeLowMemory(
+  emails: GmailMessage[],
+  generate: GenerateFn,
+  opts: AnalyzeOptions,
+): Promise<ResultItem[]> {
+  const { onLog, onProgress, signal } = opts;
+  const base = ruleBasedAnalyze(emails);
+  const byId = new Map(emails.map((e) => [e.id ?? "", e]));
+  const indexById = new Map(emails.map((e, i) => [e.id ?? "", i + 1]));
+  // Pin each result to its source index. Without this postFilterResults falls
+  // back to subject matching, and recurring digests that share a subject would
+  // collide and get dropped as duplicates.
+  for (const r of base) r.email_index = indexById.get(r.id ?? "");
+  onLog?.(`Low-memory mode: ${base.length} rule-based match(es), extracting fields…`);
+
+  for (let i = 0; i < base.length; i++) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const src = byId.get(base[i].id ?? "");
+    if (!src) continue;
+    onLog?.(`Email ${i + 1}/${base.length} · extracting…`);
+    try {
+      const raw = await generate(buildExtractPrompt(src), 0.0, LOW_MEM_MAX_TOKENS);
+      const parsed = JSON.parse(raw) as { company?: unknown; summary?: unknown };
+      const company = typeof parsed.company === "string" ? parsed.company.trim() : "";
+      const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
+      if (company) base[i].company = company;
+      if (summary) base[i].summary = summary;
+    } catch (e) {
+      onLog?.(`  [!] extraction failed, keeping rule-based fields: ${(e as Error).message}`);
+    }
+    onProgress?.((i + 1) / base.length);
+  }
+
+  // Still validate: postFilterResults nulls any company not present in the
+  // source text, which is the main hallucination risk with a 1B model.
+  return postFilterResults(base, emails);
 }
 
 export async function analyze(emails: GmailMessage[], opts: AnalyzeOptions): Promise<ResultItem[]> {
@@ -357,6 +474,8 @@ export async function analyze(emails: GmailMessage[], opts: AnalyzeOptions): Pro
 
   const generate = await makeGenerate(opts);
 
+  if (opts.lowMemory) return analyzeLowMemory(sorted, generate, opts);
+
   const results: ResultItem[] = [];
   const total = sorted.length; // BATCH_SIZE = 1
   for (let b = 0; b < total; b++) {
@@ -372,7 +491,7 @@ export async function analyze(emails: GmailMessage[], opts: AnalyzeOptions): Pro
       onLog?.(`Email ${b + 1}/${total} · pass ${p + 1}/${LLM_PASS_TEMPERATURES.length} (t=${temp})…`);
       let passResults: ResultItem[];
       try {
-        const raw = await generate(prompt, temp);
+        const raw = await generate(prompt, temp, MAX_TOKENS);
         passResults = extractResultsArray(JSON.parse(raw)).map(normalizeResult);
       } catch (e) {
         onLog?.(`  [!] pass failed, skipping: ${(e as Error).message}`);
