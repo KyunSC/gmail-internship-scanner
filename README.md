@@ -182,7 +182,7 @@ python scanner.py --rescan
 
 ## Inbox cleanup (`--clean-inbox`)
 
-`--clean-inbox` finds unread emails from job aggregators (LinkedIn, Glassdoor, Jobright, ZipRecruiter, Indeed) that the scanner did **not** surface as internship-relevant and marks them as read, clearing inbox noise.
+`--clean-inbox` finds unread emails from job aggregators (LinkedIn, Glassdoor, Jobright, Wellfound, ZipRecruiter, Indeed) that the scanner did **not** surface as internship-relevant and marks them as read, clearing inbox noise.
 
 - Without `--apply`: dry run — lists what would be marked, touches nothing
 - With `--apply`: actually marks them as read
@@ -231,7 +231,7 @@ Pre-filtered emails are sorted by Gmail message ID (stable ordering — a newly 
 
 The Ollama request passes `think: false` so Qwen3-family models route their content into the actual response instead of an empty `<think>` block. The flag is silently ignored by non-Qwen3 models.
 
-The prompt instructs the model to return only genuine internship/co-op/stage/student positions and to scan aggregator digest bodies (LinkedIn, Glassdoor, Jobright) for buried listings. Results include category, summary, action items, and priority.
+The prompt instructs the model to return only genuine internship/co-op/stage/student positions and to scan aggregator digest bodies (LinkedIn, Glassdoor, Jobright, Wellfound) for buried listings. Results include category, summary, action items, and priority.
 
 ### 4. Post-filter
 LLM results are validated:

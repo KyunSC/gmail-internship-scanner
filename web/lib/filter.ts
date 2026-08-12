@@ -18,7 +18,7 @@ export type ResultItem = {
 };
 
 // ── Sender sets ──────────────────────────────────────────────────────────────
-const AGGREGATOR_SENDERS = ["linkedin.com", "glassdoor.com", "jobright.ai", "match.indeed.com"];
+const AGGREGATOR_SENDERS = ["linkedin.com", "glassdoor.com", "jobright.ai", "match.indeed.com", "wellfound.com"];
 
 const RECRUITER_SENDER_HINTS = [
   "talent@", "careers@", "career@", "hr@", "recruiter@", "recruiting@",
@@ -117,6 +117,11 @@ function splitAggregatorListings(sender: string, body: string): string[] {
   }
   if (s.includes("match.indeed.com") && body.includes("Easily apply")) {
     return body.split("Easily apply").map((c) => c.trim()).filter(Boolean);
+  }
+  // Wellfound closes each job card with a "Learn More" CTA. Non-digest
+  // Wellfound mail lacks it and falls through to the whole-body chunk.
+  if (s.includes("wellfound.com") && body.includes("Learn More")) {
+    return body.split("Learn More").map((c) => c.trim()).filter(Boolean);
   }
   return [body];
 }

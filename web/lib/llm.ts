@@ -40,7 +40,7 @@ CLASSIFICATION PRIORITY:
 - Combine signals from the SUBJECT, BODY, and SENDER. No single field is decisive on
   its own. Strong signals: subject keywords (intern/co-op/stage/student), body content
   describing a student role, sender being a recruiter or career address.
-- For job-alert digest emails (LinkedIn, Glassdoor, Jobright), scan the ENTIRE body for
+- For job-alert digest emails (LinkedIn, Glassdoor, Jobright, Wellfound), scan the ENTIRE body for
   any internship/co-op/stage/student listing that is in the Montreal area OR remote/hybrid
   — not just the headline. Surface the email if ANY listing in it qualifies, even if it
   appears in a recommendations section.

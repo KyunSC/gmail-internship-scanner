@@ -61,6 +61,13 @@ CLEAN_INBOX_SENDERS = (
     # outreach via seekerteam@ziprecruiter.com is also caught — the subject
     # safety net keeps any internship-mentioning ones unread regardless.
     "ziprecruiter.com",
+    # Wellfound (ex-AngelList) job digests. Restricted to the hi. subdomain that
+    # sends them — team@wellfound.com (bare domain) carries account mail such as
+    # email-verification codes, which must stay unread. Wellfound subjects
+    # ("New jobs: <first listing> and 1 more jobs") never name a term, so the
+    # subject safety net below will not rescue these: every digest the scanner
+    # does not surface gets marked read.
+    "team@hi.wellfound.com",
 )
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -162,6 +169,11 @@ def _html_to_text(html: str) -> str:
 # text, so trimming generically is safe — it only fires on that sender's mail.
 _FOOTER_MARKERS = (
     "This email was intended for",  # LinkedIn
+    # Wellfound — "Not finding what you had in mind? … You're receiving this
+    # notification because you're looking for jobs on Wellfound … unsubscribe".
+    # Written without the apostrophe so a curly-quote template variant still
+    # matches. Every Wellfound mail ends with it, listings always above it.
+    "receiving this notification because",
 )
 
 
@@ -349,7 +361,7 @@ CLASSIFICATION PRIORITY:
   R&D, researcher, and research-assistant roles (including French equivalents such
   as recherche, chercheur/chercheuse, and assistant/auxiliaire de recherche) count
   as relevant technical fields when they are explicitly internships/student roles.
-- For job-alert digest emails (LinkedIn, Glassdoor, Jobright), scan the ENTIRE body for
+- For job-alert digest emails (LinkedIn, Glassdoor, Jobright, Wellfound), scan the ENTIRE body for
   any internship/co-op/stage/student listing, including research/R&D internships, that
   is in the Montreal area for in-person/hybrid work OR explicitly fully remote anywhere
   — not just the headline. Surface the email if ANY listing in it qualifies, even if it
@@ -434,7 +446,7 @@ INCLUDE only if at least one applies:
 - Subject contains intern, internship, stage, stagiaire, co-op, coop, or student
 - Body clearly describes a student / intern / co-op position
 - Recruiter or career-address message about an internship application
-For digest emails (LinkedIn, Glassdoor, Jobright), scan the FULL body — include if ANY \
+For digest emails (LinkedIn, Glassdoor, Jobright, Wellfound), scan the FULL body — include if ANY \
 listing is an internship that is in the Montreal area for in-person/hybrid work OR \
 explicitly fully remote from anywhere, even if buried in recommendations.
 
@@ -583,6 +595,12 @@ AGGREGATOR_SENDERS = (
     "glassdoor.com",
     "jobright.ai",
     "match.indeed.com",  # Indeed job alerts (not Indeed Apply confirmations)
+    # Wellfound (ex-AngelList) startup digests, from team@hi.wellfound.com.
+    # Strictly a tightening: every card is stamped "| Internship" regardless of
+    # the real role (a "Senior (Level 3) Quality Analyst | 12 years of exp" is
+    # labelled Internship too), so the intern keyword carries no signal here and
+    # the per-listing software + location + season gates do all the work.
+    "wellfound.com",
 )
 
 INTERNSHIP_KEYWORDS = (
@@ -811,9 +829,10 @@ def _split_aggregator_listings(sender: str, body: str) -> list[str]:
     """Split a digest body into per-listing chunks. Glassdoor uses ★ as the
     listing separator (after each company's rating); Jobright closes each
     recommendation with "APPLY NOW"; Indeed match digests close each listing
-    with "Easily apply". Senders without a known digest format return the whole
-    body as a single chunk. Glassdoor bodies are pre-cleaned to drop alert
-    chrome that would otherwise inject false internship signals."""
+    with "Easily apply"; Wellfound closes each card with "Learn More".
+    Senders without a known digest format return the whole body as a single
+    chunk. Glassdoor bodies are pre-cleaned to drop alert chrome that would
+    otherwise inject false internship signals."""
     s = (sender or "").lower()
     if "glassdoor.com" in s and "★" in body:
         cleaned = _clean_glassdoor_body(body)
@@ -822,6 +841,13 @@ def _split_aggregator_listings(sender: str, body: str) -> list[str]:
         return [c.strip() for c in body.split("APPLY NOW") if c.strip()]
     if "match.indeed.com" in s and "Easily apply" in body:
         return [c.strip() for c in body.split("Easily apply") if c.strip()]
+    # Wellfound cards read "<title> <company> / <size> Employees | <mode>,
+    # <city> | <n> years of exp | Internship Actively Hiring Learn More", so the
+    # CTA closes each listing. Non-digest Wellfound mail (welcome, application
+    # updates, verification codes) has no "Learn More" and falls through to the
+    # whole-body chunk, which is why the marker is part of the guard.
+    if "wellfound.com" in s and "Learn More" in body:
+        return [c.strip() for c in body.split("Learn More") if c.strip()]
     return [body]
 
 
