@@ -695,15 +695,49 @@ _EXCLUDED_ROLE_RES = (
     re.compile(r"\bsdet\b", re.IGNORECASE),
 )
 
-# The internship term the user IS targeting: Summer 2027 starts.
-# Covers French (été) and the May month forms aggregators use, plus the short
-# season code S2027. A qualifying listing must match this to be kept.
+# The internship term the user IS targeting: Summer <TARGET_YEAR> starts.
+# Listings express this term three ways — the season word ("Summer 2027"), a
+# season code ("S2027"), or a literal date range ("June 2027 - August 2027") —
+# and all three must match or a real internship gets marked read by cleanup.
+TARGET_YEAR = "2027"
+_YY = TARGET_YEAR[-2:]
+
+# Months a summer term can start in ON THEIR OWN. July onward is absent: a
+# July/August start is a Fall term. April is absent too — it would misread
+# "Winter 2027 term (Jan 2027 - Apr 2027)" as summer — and only qualifies as
+# the head of a range (see _EARLY_START).
+_START = r"(?:may|mai|jun(?:e)?|juin)"
+# Early starts that count only as the head of a range ending in summer:
+# "April 2027 through August 2027" is a 16-week summer term.
+_EARLY_START = r"(?:apr(?:il)?|avr(?:il)?|may|mai|jun(?:e)?|juin)"
+# Months a summer term can END in. Never qualifying on their own — only as the
+# tail of a range whose head already qualified. Matching August alone would let
+# "August 2027 - December 2027" through as summer.
+_END = r"(?:jul(?:y)?|juil(?:let)?|aug(?:ust)?|ao[uû]t|sep(?:t)?(?:ember|embre)?)"
+_SEP = r"(?:\s*(?:[-–—]|to|through|thru|until|till|au|jusqu['’]au|à|/)\s*)"
+_DAY = r"(?:\s*\d{1,2}(?:st|nd|rd|th)?\s*,?)?"
+
 TARGET_TERM_REGEX = re.compile(
-    r"\b(summer|[ée]t[ée])\b.{0,20}\b2027\b"
-    r"|\b2027\b.{0,20}\b(summer|[ée]t[ée])\b"
-    r"|\bmay\s*\.?\s*2027\b"
-    r"|\bmai\s*\.?\s*2027\b"
-    r"|\b[s][-\s]?2027\b",
+    # "Summer 2027" / "Summer Internship 2027" / "2027 summer" / "été 2027"
+    rf"\b(?:summer|[ée]t[ée])\b.{{0,20}}\b{TARGET_YEAR}\b"
+    rf"|\b{TARGET_YEAR}\b.{{0,20}}\b(?:summer|[ée]t[ée])\b"
+    # the unspaced form "summer2027", which the \b above rejects
+    rf"|(?:summer|[ée]t[ée]){TARGET_YEAR}\b"
+    # "Summer '27" / "Summer 27"
+    rf"|\b(?:summer|[ée]t[ée])\s*['’]?{_YY}\b"
+    # Season codes: S2027, S-2027, SU27
+    rf"|\bs[-\s]?{TARGET_YEAR}\b"
+    rf"|\bsu[-\s]?['’]?{_YY}\b"
+    # Qualifying start month + year: "May 2027", "June 4, 2027", "Jun. 2027"
+    rf"|\b{_START}\.?{_DAY}\s*{TARGET_YEAR}\b"
+    # Range whose year trails the end month: "June - August 2027", "Apr to Aug 2027"
+    rf"|\b{_EARLY_START}\.?{_DAY}{_SEP}{_END}\.?{_DAY}\s*{TARGET_YEAR}\b"
+    # ...and the same range with the year on both ends: "May 2027 - Aug 2027"
+    rf"|\b{_EARLY_START}\.?{_DAY}\s*{TARGET_YEAR}{_SEP}{_END}"
+    # ISO dates: 2027-05, 2027/06/01
+    rf"|\b{TARGET_YEAR}[-/]0?[456]\b"
+    # Numeric ranges only — a bare "05/2027" is too often a reference number
+    rf"|\b0?[456]/{TARGET_YEAR}\s*[-–—]\s*0?\d{{1,2}}/{TARGET_YEAR}\b",
     re.IGNORECASE,
 )
 
@@ -792,7 +826,11 @@ def _split_aggregator_listings(sender: str, body: str) -> list[str]:
 
 
 def _is_off_target_term(chunk: str) -> bool:
-    """True unless the listing explicitly names the target term (Summer 2027)."""
+    """True unless the listing targets the term the user wants (Summer 2027).
+
+    A listing can name that term as a season word ("Summer 2027"), a season code
+    ("S2027"), or a date range ("June 2027 - August 2027") — see
+    TARGET_TERM_REGEX."""
     return not TARGET_TERM_REGEX.search(chunk)
 
 
@@ -826,8 +864,8 @@ def _season_checked_chunks(sender: str, body: str) -> list[str]:
 
 def _all_intern_listings_excluded(sender: str, body: str) -> bool:
     """True if every listing this email qualifies on names an off-target term
-    (anything other than an explicit Summer 2027). False only if at least one
-    qualifying listing targets Summer 2027."""
+    (anything other than Summer 2027, however it is written). False only if at
+    least one qualifying listing targets Summer 2027."""
     chunks = _season_checked_chunks(sender, body)
     if not chunks:
         return True
@@ -1006,7 +1044,7 @@ def analyze_with_ollama(
         if dropped_no_signal:
             print(f"  Pre-filtered {dropped_no_signal} email(s) with no internship signal")
         if dropped_term:
-            print(f"  Pre-filtered {dropped_term} email(s) without a Summer 2027 listing")
+            print(f"  Pre-filtered {dropped_term} email(s) with no listing targeting Summer 2027")
     else:
         filtered_in = emails
         print(f"  Pre-filter disabled — sending all {len(emails)} email(s) to the LLM")
@@ -1121,7 +1159,7 @@ def analyze_with_ollama(
         # Per-listing off-target-term exclusion (body only — subject is
         # intentionally not checked). For digest aggregators the body is split
         # into individual job listings; we drop the email only if EVERY intern
-        # listing does not explicitly name Summer 2027. A mixed digest with one
+        # listing targets a term other than Summer 2027. A mixed digest with one
         # on-target intern still passes.
         body = original.get("body", "")
         if _all_intern_listings_excluded(sender, body):
@@ -1141,7 +1179,7 @@ def analyze_with_ollama(
     if dropped_aggregator:
         print(f"  Filtered out {dropped_aggregator} aggregator email(s) without internship keywords")
     if dropped_term:
-        print(f"  Filtered out {dropped_term} email(s) without a Summer 2027 listing")
+        print(f"  Filtered out {dropped_term} email(s) with no listing targeting Summer 2027")
     if dropped_dup:
         print(f"  Filtered out {dropped_dup} duplicate email(s) (LLM hallucination)")
     if dropped_unmatched:
@@ -1185,7 +1223,7 @@ def rule_based_analyze(emails: list[dict]) -> list[dict]:
     if dropped_no_signal:
         print(f"  Dropped {dropped_no_signal} email(s) with no internship signal")
     if dropped_term:
-        print(f"  Dropped {dropped_term} email(s) without a Summer 2027 listing")
+        print(f"  Dropped {dropped_term} email(s) with no listing targeting Summer 2027")
     return out
 
 
