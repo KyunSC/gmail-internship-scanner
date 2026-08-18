@@ -649,11 +649,43 @@ SOFTWARE_KEYWORDS = (
     "hardware engineer", "fpga",
     "sde intern", "swe intern",
     "web developer", "web engineer",
-    # Title phrases — anchored so they only match the listing's role,
-    # not a degree requirement like "Bachelor of ... Engineering".
-    "engineering intern", "engineering internship",
-    "engineering co-op", "engineering coop", "engineering student",
+    # NOTE: bare "engineering intern" / "engineering internship" /
+    # "engineering co-op" / "engineering student" USED to live here as "title
+    # phrases". They were removed: they are effectively bare "engineering",
+    # which the comment above this list explicitly rules out, and on real
+    # LinkedIn digests they matched a construction firm (Aecon "Co-op
+    # Engineering Student"), a baking-ingredients maker (AB Mauri "Engineering
+    # Intern"), and an aerospace supplier (Howmet "engineering intern"). None
+    # were software. Software-qualified titles still match through the
+    # "software engineering" / "computer engineering" entries above, so nothing
+    # genuinely wanted is lost — only the unqualified word.
     "stage en génie", "stage en informatique", "stagiaire en informatique",
+)
+
+# Phrases that LOOK like a software keyword but name another field. Blanked out
+# of the text before keyword matching (see _body_mentions_software) so the
+# discipline, not the bare noun, decides.
+#
+# "<discipline> engineering" covers the qualified half of the problem above —
+# "Electrical Engineering Intern" (AeroCardia), "Industrial Engineering Intern"
+# (Signify). "test engineering" is also handled by _EXCLUDED_ROLE_RES; it is
+# repeated here so this pass stands on its own.
+_NON_SOFTWARE_ENGINEERING_RE = re.compile(
+    r"\b(?:civil|mechanical|electrical|industrial|chemical|structural|mining|"
+    r"production|manufacturing|aerospace|environmental|materials|biomedical|test)"
+    r"\s+engineer(?:ing|s)?\b",
+    re.IGNORECASE,
+)
+
+# "research" is in SOFTWARE_KEYWORDS because AI/ML research roles are a real
+# source of hits, but bare it also matches "Equity Research Intern" (Wall
+# Street Oasis, surfaced by a real LinkedIn digest). Veto the finance/medical
+# senses; "AI research", "research engineer", "research scientist" still match.
+_NON_SOFTWARE_RESEARCH_RE = re.compile(
+    r"\b(?:equity|market(?:ing)?|investment|economic|econometric|clinical|"
+    r"medical|pharmaceutical|legal|policy|consumer|user|art|historical|"
+    r"literary|humanities)\s+research\b",
+    re.IGNORECASE,
 )
 
 # Location filter — the user only wants internships they can actually take:
@@ -825,7 +857,141 @@ def _clean_glassdoor_body(body: str) -> str:
     return body
 
 
-def _split_aggregator_listings(sender: str, body: str) -> list[str]:
+# LinkedIn job-alert cards read "<title> <company> · <location> (<mode>)
+# [<salary>] <badges>", where badges are any run of: Actively recruiting,
+# Easy Apply, Fast growing, or a social-proof count. A single marker is NOT
+# enough — cards routinely end with only "Easy Apply" or "12 connections" — so
+# the separator must consume a RUN of them.
+#
+# The social-proof count has more shapes than it looks: the live corpus carries
+# "1 connection", "95 mutual connections", "49 school alumni", "1 school alum"
+# AND "1 company alum". Missing one silently fuses that card into its
+# neighbour, which is the exact cross-listing leak this splitter exists to stop
+# — so the qualifier and the plural are both optional rather than enumerated.
+_LINKEDIN_CARD_SEP_RE = re.compile(
+    r"(?:\s*(?:Actively recruiting|Easy Apply|Fast growing"
+    r"|\d+\s+(?:(?:mutual|school|company)\s+)?(?:connections?|alum(?:ni)?)))+",
+    re.IGNORECASE,
+)
+
+# Not every card carries a badge. LinkedIn's "Jobs that match your profile"
+# format prints bare "<title> <company> · <location>" rows, so badge-run
+# splitting alone fuses them — one real digest ran three cards together and
+# swallowed an undated Autodesk software internship into a Fall 2026 chunk.
+#
+# The structural end of a card is the end of its location field. Matching that
+# needs care: "Canada" is also a company-name suffix ("KPMG Canada · Montreal,
+# QC"), and a mode parenthetical also appears inside titles ("Java FullStack
+# Developer (Hybrid) Morgan Stanley"). Both false cuts are ruled out by the
+# trailing (?!\s*·) — a real card end is never immediately followed by the
+# separator that introduces a location.
+#
+# Salary ("$78-$78 / hour") is deliberately NOT consumed: the badge run that
+# follows it supplies its own cut, and an orphaned salary fragment carries no
+# internship, software, or location keyword, so it cannot qualify anything.
+_LINKEDIN_CARD_END_RE = re.compile(
+    # Trailing \b on every alternative is load-bearing: without it "Canada"
+    # matches the first six letters of "Canadian Tire" and cuts mid-word.
+    r"(?:,\s*(?:QC|ON|BC|AB|MB|SK|NS|NB|NL|PE|YT|NT|NU"
+    r"|Qu[ée]bec|Ontario|British Columbia|Alberta)\b(?:,\s*Canada\b)?"
+    r"|\b(?:Canada|France|Area)\b)"
+    r"(?:\s*\((?:On-site|Hybrid|Remote)\))?"
+    r"(?:\s*(?:Actively recruiting|Easy Apply|Fast growing"
+    r"|\d+\s+(?:(?:mutual|school|company)\s+)?(?:connections?|alum(?:ni)?)))*"
+    r"(?!\s*·)",
+    re.IGNORECASE,
+)
+
+# "Apply now You have connections at <X> Ask them about the job <Person>
+# <Headline> Message <Person> <Headline> Message" — the referral block LinkedIn
+# puts in "Your saved job at X is still available" mail. Those headlines are
+# people's job titles ("Solution Associate", "Business Analyst", "Software
+# Engineer @Google"), so left in place they hand the adjacent listing a
+# software keyword it never had. Runs to the next section header, or to the end
+# of what survives the footer cut.
+_LINKEDIN_APPLY_CHROME_RE = re.compile(
+    r"Apply now\b.*?(?:Your other saved jobs|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Footer chrome after the last card.
+_LINKEDIN_FOOT_RE = re.compile(
+    r"See all (?:saved )?jobs|Install LinkedIn Widgets", re.IGNORECASE)
+
+# Header chrome. LinkedIn opens with "Jobs at <X> and more Your job alert for
+# <ALERT NAME>" — and the alert name is user-chosen ("Software Engineer"), so
+# it injects a false software keyword into the first card, exactly the echo
+# problem _clean_glassdoor_body solves for Glassdoor. Some bodies continue
+# "New jobs in <CITY> match your preferences.", which leaks a location too.
+_LINKEDIN_PREFS_RE = re.compile(r"match your preferences\.?", re.IGNORECASE)
+
+# "match your preferences" is only in 6 of 24 bodies, so it can't be the only
+# anchor. Reliable fallback: the subject is "<first listing title> at
+# <company>" and that title appears verbatim in the body — seek to it and cut.
+_LINKEDIN_HEAD_FALLBACK_RE = re.compile(
+    r"Your job alert for"
+    r"|Based on your title and location\.\s*Update"
+    r"|is still available\.",
+    re.IGNORECASE,
+)
+
+
+def _split_linkedin_cards(text: str) -> list[str]:
+    """Cut a cleaned LinkedIn body into one chunk per card.
+
+    Cut points are the union of two independent markers — the end of a badge
+    run and the end of a location field — because neither covers every format
+    on its own: alert digests give every card a badge but "Jobs that match your
+    profile" mail gives some cards none, while a location field is present on
+    every card but only recognisable when it is not immediately followed by the
+    "·" that introduces one.
+
+    Unlike a str.split the matched text stays with the card it belongs to,
+    which matters for the location field: cutting "Canada (Remote)" out of a
+    chunk would take the only evidence that the listing is remote with it."""
+    cuts = {0, len(text)}
+    for rx in (_LINKEDIN_CARD_END_RE, _LINKEDIN_CARD_SEP_RE):
+        for m in rx.finditer(text):
+            if m.end() > m.start():
+                cuts.add(m.end())
+    bounds = sorted(cuts)
+    chunks = [text[a:b].strip(" ·-") for a, b in zip(bounds, bounds[1:])]
+    return [c for c in chunks if c]
+
+
+def _clean_linkedin_body(subject: str, body: str) -> str:
+    """Strip LinkedIn job-alert chrome before chunk analysis.
+
+    The header names the user's own alert ("Your job alert for Software
+    Engineer") and often its city ("New jobs in Montreal match your
+    preferences."). Left in place, both glue onto the first card and hand it a
+    software keyword and a location it never earned — the same echo problem
+    _clean_glassdoor_body exists for.
+
+    Three anchors, most specific first: the preferences sentence (which ends
+    the whole banner, alert name and city included), then the subject's listing
+    title, then a generic header phrase. The title anchor is preferred over the
+    generic one because cutting at "Your job alert for" leaves the alert name
+    itself behind."""
+    m_prefs = _LINKEDIN_PREFS_RE.search(body)
+    if m_prefs:
+        body = body[m_prefs.end():]
+    else:
+        title = subject.rsplit(" at ", 1)[0].strip() if " at " in subject else ""
+        idx = body.find(title) if title else -1
+        if idx > 0:
+            body = body[idx:]
+        else:
+            m = _LINKEDIN_HEAD_FALLBACK_RE.search(body)
+            if m:
+                body = body[m.end():]
+    m2 = _LINKEDIN_FOOT_RE.search(body)
+    if m2:
+        body = body[:m2.start()]
+    return _LINKEDIN_APPLY_CHROME_RE.sub(" ", body)
+
+
+def _split_aggregator_listings(sender: str, body: str, subject: str = "") -> list[str]:
     """Split a digest body into per-listing chunks. Glassdoor uses ★ as the
     listing separator (after each company's rating); Jobright closes each
     recommendation with "APPLY NOW"; Indeed match digests close each listing
@@ -848,19 +1014,81 @@ def _split_aggregator_listings(sender: str, body: str) -> list[str]:
     # whole-body chunk, which is why the marker is part of the guard.
     if "wellfound.com" in s and "Learn More" in body:
         return [c.strip() for c in body.split("Learn More") if c.strip()]
+    # LinkedIn closes each card with a run of badges rather than a single CTA.
+    # Non-digest LinkedIn mail (invitations, profile-view nudges, post
+    # notifications) carries no badge run and falls through to the whole-body
+    # chunk, which is why the marker is part of the guard.
+    if "linkedin.com" in s and _LINKEDIN_CARD_SEP_RE.search(body):
+        return _split_linkedin_cards(_clean_linkedin_body(subject, body)) or [body]
     return [body]
 
 
-def _is_off_target_term(chunk: str) -> bool:
+# A term that is definitely NOT Summer 2027 — an off-target season word with a
+# year ("Fall 2026", "Automne 2026", "Winter 2027"), or a date range starting in
+# a month no summer term starts in ("Jan-April '27", "September 2026").
+#
+# Used only where listings do not state a term at all (see _is_off_target_term):
+# there, "says nothing" and "says Fall 2026" have to be told apart, which the
+# absence of TARGET_TERM_REGEX cannot do on its own.
+_OFF_SEASON = r"(?:fall|autumn|automne|winter|hiver|spring|printemps)"
+# Months a summer term never starts in. May/June/April are absent — they are
+# TARGET_TERM_REGEX's business — and July/August are absent because a range like
+# "August 2026 - December 2026" is already caught by its Fall season word, while
+# matching them bare would misread a summer term's END month as off-target.
+_OFF_START = (
+    r"(?:jan(?:uary)?|janv(?:ier)?|feb(?:ruary)?|f[ée]vr?(?:ier)?"
+    r"|sep(?:t)?(?:ember|embre)?|oct(?:ober|obre)?|nov(?:ember|embre)?"
+    r"|d[ée]c(?:ember|embre)?)"
+)
+# Any year, four-digit or apostrophised. \b cannot anchor the left of "'27"
+# (apostrophe and space are both non-word), so that branch anchors on the right.
+_ANY_YEAR = r"(?:\b20\d{2}\b|['’]\d{2}\b)"
+
+_OFF_TARGET_TERM_REGEX = re.compile(
+    # "Fall 2026", "Internship - Automne 2026", "2027 winter"
+    rf"\b{_OFF_SEASON}\b.{{0,20}}{_ANY_YEAR}"
+    rf"|{_ANY_YEAR}.{{0,20}}\b{_OFF_SEASON}\b"
+    # Range headed by an off-target month: "Jan-April '27", "Sept - Dec 2026"
+    rf"|\b{_OFF_START}\.?\s*[-–—/]\s*\w+\.?\s*{_ANY_YEAR}"
+    # Bare off-target start: "September 2026", "janvier 2027"
+    rf"|\b{_OFF_START}\.?\s*{_ANY_YEAR}",
+    re.IGNORECASE,
+)
+
+# Senders whose listings are title + company + location only and essentially
+# never state a term. Requiring an explicit "Summer 2027" from these drops every
+# listing they carry, on-target or not, which makes the sender permanently mute
+# rather than filtered. Glassdoor and Wellfound cards carry enough text to state
+# a term, so they stay on the strict rule.
+_UNDATED_CARD_SENDERS = ("linkedin.com",)
+
+
+def _states_no_term_by_convention(sender: str) -> bool:
+    s = (sender or "").lower()
+    return any(domain in s for domain in _UNDATED_CARD_SENDERS)
+
+
+def _is_off_target_term(chunk: str, lenient: bool = False) -> bool:
     """True unless the listing targets the term the user wants (Summer 2027).
 
     A listing can name that term as a season word ("Summer 2027"), a season code
     ("S2027"), or a date range ("June 2027 - August 2027") — see
-    TARGET_TERM_REGEX."""
-    return not TARGET_TERM_REGEX.search(chunk)
+    TARGET_TERM_REGEX.
+
+    lenient=True inverts the burden of proof for senders whose cards never state
+    a term (see _UNDATED_CARD_SENDERS): a listing is off-target only if it names
+    a DIFFERENT term. Silence is not evidence there, so treating it as such
+    rejected "Software Engineer Intern · LevelOps · Montreal" for saying nothing
+    at all. Off-target listings in the same digest ("Machine Learning Intern/Co-op
+    (Winter 2027)") still name their term, so they are still rejected."""
+    if TARGET_TERM_REGEX.search(chunk):
+        return False
+    if lenient:
+        return bool(_OFF_TARGET_TERM_REGEX.search(chunk))
+    return True
 
 
-def _season_checked_chunks(sender: str, body: str) -> list[str]:
+def _season_checked_chunks(sender: str, body: str, subject: str = "") -> list[str]:
     """The listings the off-target-season filter judges an email by.
 
     For aggregator digests these are exactly the listings that QUALIFY the
@@ -882,20 +1110,21 @@ def _season_checked_chunks(sender: str, body: str) -> list[str]:
     Stage"), not an internship. Counting those made almost every chunk look
     like an intern listing, and one undated impostor was enough to keep an
     all-off-target digest alive."""
-    chunks = _split_aggregator_listings(sender, body)
+    chunks = _split_aggregator_listings(sender, body, subject)
     if _is_aggregator(sender):
         return [c for c in chunks if _is_qualifying_listing(c)]
     return [c for c in chunks if _body_mentions_internship(c)]
 
 
-def _all_intern_listings_excluded(sender: str, body: str) -> bool:
+def _all_intern_listings_excluded(sender: str, body: str, subject: str = "") -> bool:
     """True if every listing this email qualifies on names an off-target term
     (anything other than Summer 2027, however it is written). False only if at
     least one qualifying listing targets Summer 2027."""
-    chunks = _season_checked_chunks(sender, body)
+    chunks = _season_checked_chunks(sender, body, subject)
     if not chunks:
         return True
-    return all(_is_off_target_term(c) for c in chunks)
+    lenient = _states_no_term_by_convention(sender)
+    return all(_is_off_target_term(c, lenient) for c in chunks)
 
 
 RECRUITER_SENDER_HINTS = (
@@ -957,7 +1186,15 @@ def _body_mentions_internship(body: str) -> bool:
 
 
 def _body_mentions_software(body: str) -> bool:
+    """True if the text names a software/tech field.
+
+    Non-software senses of otherwise-matching nouns are blanked first, so
+    "Electrical Engineering Intern" and "Equity Research Intern" no longer read
+    as software. Substituting a space (not the empty string) keeps the
+    surrounding words from fusing into a new false match."""
     b = (body or "").lower()
+    b = _NON_SOFTWARE_ENGINEERING_RE.sub(" ", b)
+    b = _NON_SOFTWARE_RESEARCH_RE.sub(" ", b)
     return any(kw in b for kw in SOFTWARE_KEYWORDS)
 
 
@@ -984,13 +1221,14 @@ def _is_qualifying_listing(chunk: str) -> bool:
             and _mentions_location(chunk) and not _mentions_excluded_role(chunk))
 
 
-def _has_software_internship_listing(sender: str, body: str) -> bool:
+def _has_software_internship_listing(sender: str, body: str, subject: str = "") -> bool:
     """True iff at least one body chunk contains an internship keyword, a
     software/tech keyword, AND an acceptable listing location. For aggregators
     with a known digest splitter this is per-listing; without one it falls back to
     a whole-body co-occurrence check (still strictly stricter than the previous
     "any intern keyword" test)."""
-    return any(_is_qualifying_listing(c) for c in _split_aggregator_listings(sender, body))
+    return any(_is_qualifying_listing(c)
+               for c in _split_aggregator_listings(sender, body, subject))
 
 
 def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
@@ -1018,7 +1256,7 @@ def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
         if (_subject_mentions_internship(subject) and _body_mentions_software(subject)
                 and _mentions_location(subject) and not _mentions_excluded_role(subject)):
             return True
-        return _has_software_internship_listing(sender, body)
+        return _has_software_internship_listing(sender, body, subject)
     if _mentions_excluded_role(subject):
         return False
     if _mentions_excluded_role(body):
@@ -1064,7 +1302,8 @@ def analyze_with_ollama(
         dropped_no_signal = len(emails) - len(signaled)
         filtered_in = [
             e for e in signaled
-            if not _all_intern_listings_excluded(e.get("from", ""), e.get("body", ""))
+            if not _all_intern_listings_excluded(e.get("from", ""), e.get("body", ""),
+                                                 e.get("subject", ""))
         ]
         dropped_term = len(signaled) - len(filtered_in)
         if dropped_no_signal:
@@ -1188,7 +1427,7 @@ def analyze_with_ollama(
         # listing targets a term other than Summer 2027. A mixed digest with one
         # on-target intern still passes.
         body = original.get("body", "")
-        if _all_intern_listings_excluded(sender, body):
+        if _all_intern_listings_excluded(sender, body, subject):
             dropped_term += 1
             continue
 
@@ -1232,7 +1471,7 @@ def rule_based_analyze(emails: list[dict]) -> list[dict]:
         if not _has_internship_signal(subject, body, sender):
             dropped_no_signal += 1
             continue
-        if _all_intern_listings_excluded(sender, body):
+        if _all_intern_listings_excluded(sender, body, subject):
             dropped_term += 1
             continue
         out.append({
