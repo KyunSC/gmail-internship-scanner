@@ -21,7 +21,7 @@ gmail-internship-scanner/
 ├── cli/                   # Local command-line scanner (Python) — this README
 │   ├── scanner.py         # Main scanner — Gmail fetch + Ollama LLM analysis
 │   ├── compare.py         # Dev tool: runs both LLM and rule-based filter, diffs results
-│   ├── show_bodies.py     # Dev tool: prints extracted body text for specific emails
+│   ├── dump_sender.py     # Dev tool: prints extracted bodies for a sender, to learn a new digest format
 │   ├── credentials.json   # Google OAuth client secret (not committed)
 │   ├── token.json         # Cached OAuth token (not committed)
 │   ├── .last_scan.json    # Accumulated scan snapshot — seen emails for incremental scans + --from-cache (not committed)
@@ -269,16 +269,6 @@ Use this to tune the prompt, adjust keyword rules, or verify that a code change 
 > **Don't run this alongside `python scanner.py`.** Both invoke Ollama, and the two processes will contend for VRAM (each spawned generate request gets its own KV cache slot reserved server-side). Run them sequentially.
 
 **Key finding from initial comparison:** The LLM correctly drops Glassdoor digest emails where `intern` appears only in the footer boilerplate (`"Create job alerts for related roles: software intern"`), while the rule-based filter cannot distinguish these from real listings. The LLM is the meaningful filter for aggregator digest noise.
-
-### `show_bodies.py` — inspect extracted email bodies
-
-Prints the full extracted body text for a set of email subjects, with internship keyword hits highlighted. Useful for debugging why an email is or isn't being caught.
-
-Edit the `SUBJECTS_TO_INSPECT` set at the top of the file, then run:
-
-```bash
-python show_bodies.py
-```
 
 ---
 

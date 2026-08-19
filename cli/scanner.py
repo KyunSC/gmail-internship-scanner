@@ -101,7 +101,7 @@ def get_gmail_service(write_access: bool = False):
             # run happens to need. Passing `needed` rewrites creds.scopes, and
             # if the token then needs a refresh it gets persisted back below at
             # that narrower scope — silently demoting a modify token to readonly.
-            # A single read-only run (compare.py without --apply, show_bodies.py)
+            # A single read-only run (compare.py without --apply, dump_sender.py)
             # was therefore enough to force the next --apply through the consent
             # screen again. modify is a superset of readonly, so the granted
             # token serves both; only clean_inbox(apply=True) ever writes.

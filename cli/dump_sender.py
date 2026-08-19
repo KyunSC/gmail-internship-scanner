@@ -1,9 +1,8 @@
 """Print the extracted bodies of emails from a given sender.
 
-A read-only variant of show_bodies.py that selects by sender substring instead of
-a hardcoded subject set. Used to reverse-engineer a new digest sender's format
-(separator marker, header/footer chrome, body length) before teaching scanner.py
-about it.
+Selects by sender substring, so a whole digest sender can be dumped at once.
+Used to reverse-engineer a new sender's format (separator marker, header/footer
+chrome, body length) before teaching scanner.py about it.
 
 Deliberately uses a raw `from:` query rather than run_gmail_search: the latter's
 intern-keyword queries would hide exactly the digests that never say "intern",

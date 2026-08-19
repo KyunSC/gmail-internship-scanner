@@ -7,7 +7,7 @@ Guidance for coding agents working in this repo. Humans: see [README.md](README.
 - `cli/` — the Python command-line scanner (Gmail fetch + local Ollama analysis). **All Python commands run from here.**
 - `web/` — a separate, fully client-side browser dashboard. Shares nothing with the CLI at runtime.
 
-## Running the CLI (`scanner.py`, `compare.py`, `show_bodies.py`)
+## Running the CLI (`scanner.py`, `compare.py`, `dump_sender.py`)
 
 These scripts live in `cli/`, not the project root, and they import each other as
 sibling modules (`compare.py` does `from scanner import ...`). Two things must be
@@ -36,7 +36,7 @@ The same rule applies to the other scripts:
 ```bash
 cd cli
 venv/bin/python scanner.py
-venv/bin/python show_bodies.py
+venv/bin/python dump_sender.py wellfound --days 180 --all
 ```
 
 Equivalent, if you'd rather activate the env first:
