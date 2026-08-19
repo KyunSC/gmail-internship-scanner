@@ -22,6 +22,7 @@ from scanner import (
     _body_mentions_software,
     _has_internship_signal,
     _is_aggregator,
+    _is_linkedin_noise_sender,
     _is_off_target_term,
     _is_qualifying_listing,
     _split_aggregator_listings,
@@ -89,14 +90,40 @@ TRANSACTIONAL_BODY = (
     "Add skills to your profile so recruiters can find you."
 )
 
-# Term strings, judged under the lenient (LinkedIn) policy. Silence means
-# "undated", not "off-target"; only a DIFFERENT term is disqualifying.
-LENIENT_TERM_CASES = [
-    # (chunk text, expected _is_off_target_term under lenient)
-    ("Software Engineer Intern LevelOps · Montreal, QC (Hybrid)", False),
-    ("Machine Learning Intern Epic Games · Greater Montreal Area", False),
+INVITATION_SENDER = "Angelo El Hajj <invitations@linkedin.com>"
+
+# A real connection invitation (message 60d sample). Unlike TRANSACTIONAL_BODY
+# this one DOES carry a badge run — "Accept View profile 38 connections" — so
+# the splitter treats it as a digest and the first chunk becomes the sender's
+# profile headline. That headline has an intern keyword ("Co-op Student"), a
+# software keyword ("Computer Engineering") and a location ("Laval, QC"), so it
+# qualified as a listing. The term gate would now reject it as undated, but the
+# sender check is what actually belongs here: an invitation is not job mail
+# whatever term a profile headline happens to mention.
+INVITATION_BODY = (
+    "Angelo is waiting for your response "
+    "Angelo El Hajj Computer Engineering Co-op Student | Concordia University "
+    "Laval, QC Accept View profile 38 connections in common "
+    "More people you may know Nicole Wang CS & Stats @ McGill | "
+    "Events Director @ McWiCS View profile View profile"
+)
+
+# Term strings under the single strict policy that now applies to every sender,
+# LinkedIn included: a listing is on-target only if it explicitly names Summer
+# 2027. Silence is off-target, and so is a bare year with no season word.
+TERM_CASES = [
+    # (chunk text, expected _is_off_target_term)
     ("Intern, AI Solutions (May - August 2027) PSP · Montreal, QC", False),
-    ("QC - Risk Services - Intern Cyber Security 2027 KPMG · Montreal", False),
+    ("Software Engineer Intern (Summer 2027) Acme · Montreal, QC", False),
+    ("Stagiaire en développement logiciel - Été 2027 Flare · Montreal", False),
+    # Undated cards — the shape LinkedIn's exemption used to let through, and
+    # exactly the shape of the KPMG card that motivated dropping it.
+    ("QC - Stagiaire Développeur Frontend (Angular) KPMG Canada · Montreal, QC", True),
+    ("Software Engineer Intern LevelOps · Montreal, QC (Hybrid)", True),
+    ("Machine Learning Intern Epic Games · Greater Montreal Area", True),
+    # A bare year names no season, so it is not an explicit Summer 2027 term.
+    ("QC - Risk Services - Intern Cyber Security 2027 KPMG · Montreal", True),
+    # Listings naming a different term were already rejected, and still are.
     ("Machine Learning Intern/Co-op (Winter 2027) Cohere · Canada", True),
     ("Stagiaire DevOps - Automne 2026 Tecsys Inc. · Montreal, QC", True),
     ("Consultant, Internship (Jan-April '27) KPMG Canada · Montreal", True),
@@ -105,6 +132,24 @@ LENIENT_TERM_CASES = [
     ("Analyst Intern (September 2026) Foo Inc · Montreal, QC", True),
     ("Stagiaire, Génie industriel - Méthodes (Automne 2026) · Montreal", True),
 ]
+
+# The digest that ended LinkedIn's undated-card exemption (message
+# 1a00fcb66bb4519d, 17 Aug 2026). Two cards, neither of them a Summer 2027
+# software internship: McKesson's names Fall 2026 AND is a QA role, and KPMG's
+# names no term at all. The KPMG card qualified on intern + software + Montreal
+# and, being undated, used to count as on-target — so the email was surfaced
+# even though the user had checked and found no Summer 2027 role in it.
+KPMG_FRONTEND_SUBJECT = "QC - Stagiaire Développeur Frontend (Angular) at KPMG Canada"
+KPMG_FRONTEND_BODY = (
+    "Jobs at KPMG Canada and more Your job alert for Engineer Intern "
+    "New jobs in Montreal match your preferences. "
+    "QC - Stagiaire Développeur Frontend (Angular) KPMG Canada · Montreal, QC "
+    "(On-site) Actively recruiting "
+    "Stagiaire en automatisation de l'assurance qualité (AQ) - Automne 2026 / "
+    "QA Automation Engineer Intern - Fall 2026 McKesson · Montreal, QC "
+    "Actively recruiting See all jobs Install LinkedIn Widgets "
+    "Stay updated at a glance Add widget"
+)
 
 # Bare "engineering" titles that used to sit in SOFTWARE_KEYWORDS, and the
 # software-qualified ones that must keep matching.
@@ -178,7 +223,7 @@ def main() -> int:
     # 4. The actual bug: no single listing is both wanted and on-target. The
     #    email was surfaced on four conditions met by four different listings.
     for c in chunks:
-        check(failures, not (_is_qualifying_listing(c) and not _is_off_target_term(c, True)),
+        check(failures, not (_is_qualifying_listing(c) and not _is_off_target_term(c)),
               f"listing wrongly both qualifying and on-target: {c!r}")
 
     check(failures,
@@ -207,13 +252,15 @@ def main() -> int:
     for c in listings:
         check(failures, c.count(" · ") == 1,
               f"no-badge chunk spans multiple listings: {c!r}")
-    # The undated Autodesk listing must survive as its own chunk — fused into
-    # the Fall 2026 rows it would be judged off-target and the email dropped.
+    # The Autodesk listing must survive as its own chunk: per-listing verdicts
+    # are only meaningful if one card is one chunk. It is undated, so under the
+    # strict term rule it is off-target on its own merits — not because it
+    # inherited "Fall 2026" from a neighbour it was fused with.
     autodesk = [c for c in nobadge if "Autodesk" in c]
-    check(failures,
-          len(autodesk) == 1 and _is_qualifying_listing(autodesk[0])
-          and not _is_off_target_term(autodesk[0], True),
-          f"undated Autodesk listing did not survive as its own chunk: {autodesk}")
+    check(failures, len(autodesk) == 1 and _is_qualifying_listing(autodesk[0]),
+          f"Autodesk listing did not survive as its own qualifying chunk: {autodesk}")
+    check(failures, autodesk and "2026" not in autodesk[0],
+          f"Autodesk chunk absorbed a neighbouring card's term: {autodesk}")
 
     # 7. Saved-jobs referral chrome is stripped, not fused onto the next job.
     saved = split(SAVED_JOBS_BODY, "Analyste - Audit et Assurance TI at Deloitte")
@@ -241,38 +288,76 @@ def main() -> int:
                                      TRANSACTIONAL_BODY, LINKEDIN_SENDER),
           "profile nudge was surfaced as an internship")
 
-    # 10. Term policy: LinkedIn cards state a term so rarely that requiring one
-    #    mutes the sender, so silence is tolerated and only a DIFFERENT term
-    #    disqualifies.
-    for text, expected in LENIENT_TERM_CASES:
-        got = _is_off_target_term(text, True)
+    # 10. Term policy: one strict rule for every sender. A listing is on-target
+    #     only if it explicitly names Summer 2027; silence is not evidence of a
+    #     summer start, and LinkedIn is no longer exempt from that.
+    for text, expected in TERM_CASES:
+        got = _is_off_target_term(text)
         check(failures, got is expected,
-              f"lenient term verdict {got} != {expected} for {text!r}")
+              f"term verdict {got} != {expected} for {text!r}")
 
-    # ...and the strict policy is unchanged, so an undated listing is still
-    # off-target for every other sender.
-    check(failures,
-          _is_off_target_term("Software Engineer Intern LevelOps · Montreal, QC"),
-          "strict policy stopped rejecting an undated listing")
-    check(failures,
-          not _is_off_target_term("Software Engineer Intern (Summer 2027) Acme", True),
-          "an explicitly on-target listing was judged off-target")
-
-    # 11. The leniency is scoped to LinkedIn. Wellfound cards carry enough text
-    #     to state a term, so an undated Wellfound listing must still be dropped.
+    # 11. The same rule reaches the other aggregators, which never had the
+    #     exemption: an undated Wellfound listing is dropped as it always was.
     wellfound_body = (
         "< Software Engineer Intern Nimbus Labs / 11-50 Employees | "
         "In office, Montreal | 0 years of exp | Internship Actively Hiring Learn More <"
     )
     check(failures,
           _all_intern_listings_excluded(WELLFOUND_SENDER, wellfound_body),
-          "undated Wellfound listing was rescued by LinkedIn's lenient policy")
+          "undated Wellfound listing survived the term gate")
 
     # 12. Bare "engineering" no longer reads as software, in either direction.
     for text, expected in SOFTWARE_KEYWORD_CASES:
         got = _body_mentions_software(text)
         check(failures, got is expected,
               f"software verdict {got} != {expected} for {text!r}")
+
+    # 13. Connection invitations are not job digests. The body splits like one
+    #     and its first chunk qualifies as a listing, so the gate has to reject
+    #     it on the sender, before any chunk-level reasoning runs.
+    check(failures, _is_linkedin_noise_sender(INVITATION_SENDER),
+          "invitations@linkedin.com is not treated as LinkedIn noise")
+    check(failures,
+          not _has_internship_signal("I want to connect", INVITATION_BODY,
+                                     INVITATION_SENDER),
+          "connection invitation was surfaced as an internship")
+    # The profile headline really does look like a listing — if this stops being
+    # true the check above would pass for the wrong reason.
+    headline = "Angelo El Hajj Computer Engineering Co-op Student | " \
+               "Concordia University Laval, QC"
+    check(failures, _is_qualifying_listing(headline),
+          "profile headline no longer qualifies — check 13 is now vacuous")
+    # ...and the real job senders keep normal handling.
+    for addr in ("jobalerts-noreply@linkedin.com", "jobs-noreply@linkedin.com",
+                 "jobs-listings@linkedin.com"):
+        check(failures, not _is_linkedin_noise_sender(addr),
+              f"job sender {addr!r} was wrongly classed as noise")
+
+    # 14. The KPMG frontend digest, end to end. Both cards must be rejected for
+    #     their own reason: the McKesson row for being a Fall 2026 QA role, the
+    #     KPMG row for naming no term at all.
+    kpmg = split(KPMG_FRONTEND_BODY, KPMG_FRONTEND_SUBJECT)
+    listings = [c for c in kpmg if " · " in c]
+    check(failures, len(listings) == 2,
+          f"KPMG frontend digest split into {len(listings)} listing(s), "
+          f"expected 2: {kpmg}")
+    frontend = [c for c in listings if "KPMG" in c]
+    check(failures, len(frontend) == 1 and _is_qualifying_listing(frontend[0]),
+          f"KPMG frontend card stopped qualifying — check 14 is now vacuous: "
+          f"{frontend}")
+    check(failures, frontend and _is_off_target_term(frontend[0]),
+          f"undated KPMG frontend card was judged on-target: {frontend}")
+    check(failures,
+          _all_intern_listings_excluded(LINKEDIN_SENDER, KPMG_FRONTEND_BODY,
+                                        KPMG_FRONTEND_SUBJECT),
+          "KPMG frontend digest survived the term gate")
+    check(failures,
+          not (_has_internship_signal(KPMG_FRONTEND_SUBJECT, KPMG_FRONTEND_BODY,
+                                      LINKEDIN_SENDER)
+               and not _all_intern_listings_excluded(LINKEDIN_SENDER,
+                                                     KPMG_FRONTEND_BODY,
+                                                     KPMG_FRONTEND_SUBJECT)),
+          "KPMG frontend digest would still reach the LLM as an internship")
 
     if failures:
         print(f"FAILED {len(failures)} check(s):")

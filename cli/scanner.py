@@ -1023,69 +1023,27 @@ def _split_aggregator_listings(sender: str, body: str, subject: str = "") -> lis
     return [body]
 
 
-# A term that is definitely NOT Summer 2027 — an off-target season word with a
-# year ("Fall 2026", "Automne 2026", "Winter 2027"), or a date range starting in
-# a month no summer term starts in ("Jan-April '27", "September 2026").
-#
-# Used only where listings do not state a term at all (see _is_off_target_term):
-# there, "says nothing" and "says Fall 2026" have to be told apart, which the
-# absence of TARGET_TERM_REGEX cannot do on its own.
-_OFF_SEASON = r"(?:fall|autumn|automne|winter|hiver|spring|printemps)"
-# Months a summer term never starts in. May/June/April are absent — they are
-# TARGET_TERM_REGEX's business — and July/August are absent because a range like
-# "August 2026 - December 2026" is already caught by its Fall season word, while
-# matching them bare would misread a summer term's END month as off-target.
-_OFF_START = (
-    r"(?:jan(?:uary)?|janv(?:ier)?|feb(?:ruary)?|f[ée]vr?(?:ier)?"
-    r"|sep(?:t)?(?:ember|embre)?|oct(?:ober|obre)?|nov(?:ember|embre)?"
-    r"|d[ée]c(?:ember|embre)?)"
-)
-# Any year, four-digit or apostrophised. \b cannot anchor the left of "'27"
-# (apostrophe and space are both non-word), so that branch anchors on the right.
-_ANY_YEAR = r"(?:\b20\d{2}\b|['’]\d{2}\b)"
-
-_OFF_TARGET_TERM_REGEX = re.compile(
-    # "Fall 2026", "Internship - Automne 2026", "2027 winter"
-    rf"\b{_OFF_SEASON}\b.{{0,20}}{_ANY_YEAR}"
-    rf"|{_ANY_YEAR}.{{0,20}}\b{_OFF_SEASON}\b"
-    # Range headed by an off-target month: "Jan-April '27", "Sept - Dec 2026"
-    rf"|\b{_OFF_START}\.?\s*[-–—/]\s*\w+\.?\s*{_ANY_YEAR}"
-    # Bare off-target start: "September 2026", "janvier 2027"
-    rf"|\b{_OFF_START}\.?\s*{_ANY_YEAR}",
-    re.IGNORECASE,
-)
-
-# Senders whose listings are title + company + location only and essentially
-# never state a term. Requiring an explicit "Summer 2027" from these drops every
-# listing they carry, on-target or not, which makes the sender permanently mute
-# rather than filtered. Glassdoor and Wellfound cards carry enough text to state
-# a term, so they stay on the strict rule.
-_UNDATED_CARD_SENDERS = ("linkedin.com",)
-
-
-def _states_no_term_by_convention(sender: str) -> bool:
-    s = (sender or "").lower()
-    return any(domain in s for domain in _UNDATED_CARD_SENDERS)
-
-
-def _is_off_target_term(chunk: str, lenient: bool = False) -> bool:
-    """True unless the listing targets the term the user wants (Summer 2027).
+def _is_off_target_term(chunk: str) -> bool:
+    """True unless the listing explicitly targets the term the user wants
+    (Summer 2027). Silence is off-target: a listing that names no term at all is
+    not evidence of a summer start.
 
     A listing can name that term as a season word ("Summer 2027"), a season code
     ("S2027"), or a date range ("June 2027 - August 2027") — see
-    TARGET_TERM_REGEX.
+    TARGET_TERM_REGEX. A bare year ("Intern Cyber Security 2027") is none of
+    those and does not qualify.
 
-    lenient=True inverts the burden of proof for senders whose cards never state
-    a term (see _UNDATED_CARD_SENDERS): a listing is off-target only if it names
-    a DIFFERENT term. Silence is not evidence there, so treating it as such
-    rejected "Software Engineer Intern · LevelOps · Montreal" for saying nothing
-    at all. Off-target listings in the same digest ("Machine Learning Intern/Co-op
-    (Winter 2027)") still name their term, so they are still rejected."""
-    if TARGET_TERM_REGEX.search(chunk):
-        return False
-    if lenient:
-        return bool(_OFF_TARGET_TERM_REGEX.search(chunk))
-    return True
+    LinkedIn digests were previously exempted from this rule, on the grounds
+    that their cards are title + company + location only and so almost never
+    state a term; silence there was read as "undated, maybe summer" and only a
+    DIFFERENT term ("Winter 2027") disqualified. That exemption is what let
+    "QC - Stagiaire Développeur Frontend (Angular) · KPMG Canada · Montreal, QC"
+    through — a card with no term is indistinguishable from an on-target one
+    under that reading, so every undated LinkedIn card passed. Requiring the
+    term from every sender costs real recall on LinkedIn (undated cards that
+    genuinely are Summer 2027 are now dropped too) and is the deliberate trade:
+    a silent card is not a Summer 2027 listing."""
+    return not TARGET_TERM_REGEX.search(chunk)
 
 
 def _season_checked_chunks(sender: str, body: str, subject: str = "") -> list[str]:
@@ -1097,8 +1055,8 @@ def _season_checked_chunks(sender: str, body: str, subject: str = "") -> list[st
     chunk with an internship keyword instead let the two filters disagree about
     which listing mattered: a digest could be surfaced on an off-target listing
     (e.g. a Fall 2026 front-end role) and then rescued from this filter by an
-    unrelated undated one (a QA technician posting in another province), so
-    neither listing was one the user wanted.
+    unrelated Summer 2027 one the user could not take (a QA technician posting
+    in another province), so neither listing was one the user wanted.
 
     Non-aggregator bodies are deliberately not location-filtered (see
     _mentions_location), so they fall back to a plain internship-keyword test
@@ -1108,8 +1066,8 @@ def _season_checked_chunks(sender: str, body: str, subject: str = "") -> list[st
     variant: that one also matches a bare "stage", which is a company-maturity
     label in these digests ("Cohere · Late Stage", "TechInsights · Growth
     Stage"), not an internship. Counting those made almost every chunk look
-    like an intern listing, and one undated impostor was enough to keep an
-    all-off-target digest alive."""
+    like an intern listing, so one impostor that happened to sit near a
+    Summer 2027 date was enough to keep an all-off-target digest alive."""
     chunks = _split_aggregator_listings(sender, body, subject)
     if _is_aggregator(sender):
         return [c for c in chunks if _is_qualifying_listing(c)]
@@ -1117,14 +1075,13 @@ def _season_checked_chunks(sender: str, body: str, subject: str = "") -> list[st
 
 
 def _all_intern_listings_excluded(sender: str, body: str, subject: str = "") -> bool:
-    """True if every listing this email qualifies on names an off-target term
-    (anything other than Summer 2027, however it is written). False only if at
-    least one qualifying listing targets Summer 2027."""
+    """True if no listing this email qualifies on explicitly targets Summer 2027
+    (however that term is written). False only if at least one qualifying
+    listing names it — a listing that states no term counts as excluded."""
     chunks = _season_checked_chunks(sender, body, subject)
     if not chunks:
         return True
-    lenient = _states_no_term_by_convention(sender)
-    return all(_is_off_target_term(c, lenient) for c in chunks)
+    return all(_is_off_target_term(c) for c in chunks)
 
 
 RECRUITER_SENDER_HINTS = (
@@ -1160,6 +1117,35 @@ INDEED_NOISE_SENDERS = ("no-reply@indeed.com", "noreply@indeed.com")
 def _is_indeed_noise_sender(sender: str) -> bool:
     s = (sender or "").lower()
     return any(addr in s for addr in INDEED_NOISE_SENDERS)
+
+
+# LinkedIn's non-job mail, which shares the linkedin.com domain that puts the
+# sender in AGGREGATOR_SENDERS. Connection invitations are the damaging case:
+# the card splitter fires on their "Accept View profile · N connections" chrome,
+# and the first chunk is the sender's own profile headline — "Angelo El Hajj
+# Computer Engineering Co-op Student | Concordia University Laval, QC" carries
+# an intern keyword, a software keyword and a location, so it reads as a
+# qualifying listing. 8 of 31 invitations in a 60-day sample were surfaced as
+# internships. The term filter no longer covers for this — a headline states no
+# term, so it is off-target now — but the sender check is the honest fix: these
+# are not job mail at all, whatever term a headline happens to mention.
+# Real job mail comes from jobalerts-noreply@, jobs-noreply@ and jobs-listings@,
+# none of which match here, so they keep normal handling. None of these
+# addresses is in CLEAN_INBOX_SENDERS either — they are never marked read, just
+# no longer mistaken for job listings.
+LINKEDIN_NOISE_SENDERS = (
+    "invitations@linkedin.com",
+    "notifications-noreply@linkedin.com",
+    "messages-noreply@linkedin.com",
+    "newsletters-noreply@linkedin.com",
+    "editors-noreply@linkedin.com",
+    "member@linkedin.com",
+)
+
+
+def _is_linkedin_noise_sender(sender: str) -> bool:
+    s = (sender or "").lower()
+    return any(addr in s for addr in LINKEDIN_NOISE_SENDERS)
 
 
 # Word-boundary patterns for internship keywords. Plain substring matching wrongly
@@ -1239,7 +1225,7 @@ def _has_internship_signal(subject: str, body: str, sender: str) -> bool:
     AND check (intern + software in the same listing) is the stricter form."""
     # Indeed engagement nudges (no-reply@indeed.com) aren't job postings even
     # though their bodies mention a role + location — never surface them.
-    if _is_indeed_noise_sender(sender):
+    if _is_indeed_noise_sender(sender) or _is_linkedin_noise_sender(sender):
         return False
     if _is_aggregator(sender):
         # Excluded (QA/testing) roles are filtered PER LISTING here, never on the
