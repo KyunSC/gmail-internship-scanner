@@ -601,6 +601,11 @@ AGGREGATOR_SENDERS = (
     # labelled Internship too), so the intern keyword carries no signal here and
     # the per-listing software + location + season gates do all the work.
     "wellfound.com",
+    # Intern Insider saved-filter alerts (alerts@interninsider.me). Its weekly
+    # "[JUST DROPPED] 45+ New Internships" newsletters come from the same domain
+    # and have no card structure; they fall through to the whole-body chunk,
+    # which the per-listing gate then judges as one listing.
+    "interninsider.me",
 )
 
 INTERNSHIP_KEYWORDS = (
@@ -991,6 +996,57 @@ def _clean_linkedin_body(subject: str, body: str) -> str:
     return _LINKEDIN_APPLY_CHROME_RE.sub(" ", body)
 
 
+# Intern Insider saved-filter alerts read "<n> new match(es) for "<alert>"
+# <cadence> Hi <name>, <n> new internships matching your saved filter Here are
+# the newest roles matching your "<alert>" filter. <card> just now <card> just
+# now ... Applying early is ...".
+#
+# The alert's NAME is echoed twice in that header and once more in the footer,
+# and the name the user saved is "Summer 2027" — the very term
+# _is_off_target_term looks for. Left in place it answers the season filter
+# from the digest's own subject rather than from any listing, so every Intern
+# Insider email passed the term check no matter what its cards said. That is
+# exactly the leak the LinkedIn tightening closed, arriving through a different
+# sender.
+_INTERNINSIDER_HEAD_RE = re.compile(
+    r"Here are the newest roles matching your\s+.{0,80}?\s*filter\.",
+    re.IGNORECASE,
+)
+
+# "+ N more, open in Intern Insider to view" trails a truncated digest, and the
+# literal "Intern Insider" in it reads as an intern keyword. Cut it along with
+# the CTA and unsubscribe blocks below it.
+_INTERNINSIDER_FOOT_RE = re.compile(
+    r"\+\s*\d+\s+more, open in|Applying early is|You'?re receiving this email because",
+    re.IGNORECASE,
+)
+
+# Each card closes with its posting age. Only "just now" appears in the live
+# corpus (125 occurrences across 90 emails), but a card whose age rolls over
+# before the digest is sent would otherwise fuse into its neighbour — the same
+# cross-listing leak the LinkedIn badge run guards against — so the relative
+# forms are accepted too.
+_INTERNINSIDER_CARD_SEP_RE = re.compile(
+    r"\s*(?:just now|yesterday|"
+    r"\d+\s+(?:second|minute|hour|day|week|month)s?\s+ago)\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_interninsider_body(body: str) -> str:
+    """Strip Intern Insider alert chrome before chunk analysis: the header
+    through the alert-name echo, and everything from the "+ N more" / CTA /
+    unsubscribe footer onward. What is left is the card run, which
+    _INTERNINSIDER_CARD_SEP_RE splits on each card's posting age."""
+    m = _INTERNINSIDER_HEAD_RE.search(body)
+    if m:
+        body = body[m.end():]
+    m2 = _INTERNINSIDER_FOOT_RE.search(body)
+    if m2:
+        body = body[:m2.start()]
+    return body.strip()
+
+
 def _split_aggregator_listings(sender: str, body: str, subject: str = "") -> list[str]:
     """Split a digest body into per-listing chunks. Glassdoor uses ★ as the
     listing separator (after each company's rating); Jobright closes each
@@ -1014,6 +1070,16 @@ def _split_aggregator_listings(sender: str, body: str, subject: str = "") -> lis
     # whole-body chunk, which is why the marker is part of the guard.
     if "wellfound.com" in s and "Learn More" in body:
         return [c.strip() for c in body.split("Learn More") if c.strip()]
+    # Intern Insider closes each card with its posting age ("just now"). The
+    # guard is the header sentence, not the age marker: it appears only in
+    # saved-filter alert digests, so the weekly newsletters from the same domain
+    # fall through to the whole-body chunk instead of being split on a stray
+    # "2 days ago".
+    if "interninsider.me" in s and _INTERNINSIDER_HEAD_RE.search(body):
+        cleaned = _clean_interninsider_body(body)
+        chunks = [c.strip() for c in _INTERNINSIDER_CARD_SEP_RE.split(cleaned) if c.strip()]
+        if chunks:
+            return chunks
     # LinkedIn closes each card with a run of badges rather than a single CTA.
     # Non-digest LinkedIn mail (invitations, profile-view nudges, post
     # notifications) carries no badge run and falls through to the whole-body
