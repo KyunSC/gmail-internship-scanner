@@ -68,6 +68,8 @@ CLEAN_INBOX_SENDERS = (
     # subject safety net below will not rescue these: every digest the scanner
     # does not surface gets marked read.
     "team@hi.wellfound.com",
+    # Saved-filter digests; keep account mail from other addresses out of cleanup.
+    "alerts@interninsider.me",
 )
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -796,6 +798,22 @@ TARGET_TERM_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# Bound each year before excluding the target so a four-digit target cannot
+# backtrack into a two-digit or partial-year match.
+_OTHER_YEAR = rf"(?!{TARGET_YEAR}\b)\d{{4}}\b"
+_OTHER_SHORT_YEAR = rf"(?!{_YY}\b)\d{{2}}\b"
+_OTHER_TERM_REGEX = re.compile(
+    r"\b(?:winter|fall|autumn|spring|hiver|automne|printemps)\b.{0,20}\b\d{4}\b"
+    r"|\b\d{4}\b.{0,20}\b(?:winter|fall|autumn|spring|hiver|automne|printemps)\b"
+    rf"|\b(?:summer|[ée]t[ée])\b.{{0,20}}\b{_OTHER_YEAR}"
+    rf"|\b{_OTHER_YEAR}.{{0,20}}\b(?:summer|[ée]t[ée])\b"
+    rf"|\b(?:summer|[ée]t[ée]){_OTHER_YEAR}"
+    rf"|\b(?:summer|[ée]t[ée])\s*['’]?{_OTHER_SHORT_YEAR}"
+    r"|\b[wf]\s*[-–—]?\s*['’]?(?:\d{4}|\d{2})\b"
+    rf"|\bsu?\s*[-–—]?\s*['’]?(?:{_OTHER_YEAR}|{_OTHER_SHORT_YEAR})",
+    re.IGNORECASE,
+)
+
 _GLASSDOOR_LISTINGS_HEAD_RE = re.compile(
     r"Your job listings for\s+\w+\s+\d+,\s+\d{4}",
     re.IGNORECASE,
@@ -1001,17 +1019,28 @@ def _clean_linkedin_body(subject: str, body: str) -> str:
 # the newest roles matching your "<alert>" filter. <card> just now <card> just
 # now ... Applying early is ...".
 #
-# The alert's NAME is echoed twice in that header and once more in the footer,
-# and the name the user saved is "Summer 2027" — the very term
-# _is_off_target_term looks for. Left in place it answers the season filter
-# from the digest's own subject rather than from any listing, so every Intern
-# Insider email passed the term check no matter what its cards said. That is
-# exactly the leak the LinkedIn tightening closed, arriving through a different
-# sender.
+# The saved-filter name remains stripped from listing text. It supplies only
+# a digest-level term signal: each listing must independently pass internship,
+# software, location, and excluded-role checks. Another stated term vetoes
+# inheritance, while an explicit target term in the listing continues to win.
 _INTERNINSIDER_HEAD_RE = re.compile(
     r"Here are the newest roles matching your\s+.{0,80}?\s*filter\.",
     re.IGNORECASE,
 )
+
+_INTERNINSIDER_ALERT_NAME_RE = re.compile(
+    r'Here are the newest roles matching your\s+["“]([^"“”]{1,80})["”]\s*filter\.',
+    re.IGNORECASE,
+)
+
+
+def _inherited_target_term(sender: str, body: str) -> bool:
+    """Use only an Intern Insider saved-filter name from the uncleaned body."""
+    if "interninsider.me" not in (sender or "").lower():
+        return False
+    match = _INTERNINSIDER_ALERT_NAME_RE.search(body)
+    return bool(match and TARGET_TERM_REGEX.search(match.group(1)))
+
 
 # "+ N more, open in Intern Insider to view" trails a truncated digest, and the
 # literal "Intern Insider" in it reads as an intern keyword. Cut it along with
@@ -1021,14 +1050,14 @@ _INTERNINSIDER_FOOT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Each card closes with its posting age. Only "just now" appears in the live
-# corpus (125 occurrences across 90 emails), but a card whose age rolls over
-# before the digest is sent would otherwise fuse into its neighbour — the same
-# cross-listing leak the LinkedIn badge run guards against — so the relative
-# forms are accepted too.
+# Each card closes with its posting age. Measured on 2026-09-13 across 98
+# alerts: "just now" ×165 and "Nh ago" ×14. Splitting abbreviated ages fixes
+# four merged alerts, increasing total chunks from 172 to 179. Keep long forms
+# too so aging cards cannot borrow keywords from their neighbours.
 _INTERNINSIDER_CARD_SEP_RE = re.compile(
-    r"\s*(?:just now|yesterday|"
-    r"\d+\s+(?:second|minute|hour|day|week|month)s?\s+ago)\s*",
+    r"\s*\b(?:just now|yesterday|"
+    r"\d+\s*(?:mo|[smhdw])\s+ago|"
+    r"\d+\s+(?:second|minute|hour|day|week|month)s?\s+ago)\b\s*",
     re.IGNORECASE,
 )
 
@@ -1070,7 +1099,7 @@ def _split_aggregator_listings(sender: str, body: str, subject: str = "") -> lis
     # whole-body chunk, which is why the marker is part of the guard.
     if "wellfound.com" in s and "Learn More" in body:
         return [c.strip() for c in body.split("Learn More") if c.strip()]
-    # Intern Insider closes each card with its posting age ("just now"). The
+    # Intern Insider closes each card with its posting age ("just now", "1h ago"). The
     # guard is the header sentence, not the age marker: it appears only in
     # saved-filter alert digests, so the weekly newsletters from the same domain
     # fall through to the whole-body chunk instead of being split on a stray
@@ -1089,27 +1118,18 @@ def _split_aggregator_listings(sender: str, body: str, subject: str = "") -> lis
     return [body]
 
 
-def _is_off_target_term(chunk: str) -> bool:
-    """True unless the listing explicitly targets the term the user wants
-    (Summer 2027). Silence is off-target: a listing that names no term at all is
-    not evidence of a summer start.
+def _is_off_target_term(chunk: str, inherited: bool = False) -> bool:
+    """True unless a listing explicitly targets Summer 2027 or inherits it.
 
-    A listing can name that term as a season word ("Summer 2027"), a season code
-    ("S2027"), or a date range ("June 2027 - August 2027") — see
-    TARGET_TERM_REGEX. A bare year ("Intern Cyber Security 2027") is none of
-    those and does not qualify.
-
-    LinkedIn digests were previously exempted from this rule, on the grounds
-    that their cards are title + company + location only and so almost never
-    state a term; silence there was read as "undated, maybe summer" and only a
-    DIFFERENT term ("Winter 2027") disqualified. That exemption is what let
-    "QC - Stagiaire Développeur Frontend (Angular) · KPMG Canada · Montreal, QC"
-    through — a card with no term is indistinguishable from an on-target one
-    under that reading, so every undated LinkedIn card passed. Requiring the
-    term from every sender costs real recall on LinkedIn (undated cards that
-    genuinely are Summer 2027 are now dropped too) and is the deliberate trade:
-    a silent card is not a Summer 2027 listing."""
-    return not TARGET_TERM_REGEX.search(chunk)
+    Explicit target terms always win, even alongside another term. Otherwise,
+    only Intern Insider alerts with a target-named saved filter may supply the
+    term, and another stated term vetoes that inheritance. All listing gates
+    still apply separately. Other senders continue to require an explicit term.
+    A bare year ("Intern Cyber Security 2027") is not an explicit target term.
+    """
+    if TARGET_TERM_REGEX.search(chunk):
+        return False
+    return not inherited or bool(_OTHER_TERM_REGEX.search(chunk))
 
 
 def _season_checked_chunks(sender: str, body: str, subject: str = "") -> list[str]:
@@ -1141,13 +1161,16 @@ def _season_checked_chunks(sender: str, body: str, subject: str = "") -> list[st
 
 
 def _all_intern_listings_excluded(sender: str, body: str, subject: str = "") -> bool:
-    """True if no listing this email qualifies on explicitly targets Summer 2027
-    (however that term is written). False only if at least one qualifying
-    listing names it — a listing that states no term counts as excluded."""
+    """True if no qualifying listing has an explicit or inherited target term.
+
+    Intern Insider saved-filter inheritance is vetoed by another stated term;
+    an explicit target term always wins. Empty qualifying sets stay excluded.
+    """
+    inherited = _inherited_target_term(sender, body)
     chunks = _season_checked_chunks(sender, body, subject)
     if not chunks:
         return True
-    return all(_is_off_target_term(c) for c in chunks)
+    return all(_is_off_target_term(c, inherited) for c in chunks)
 
 
 RECRUITER_SENDER_HINTS = (
