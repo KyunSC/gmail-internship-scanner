@@ -20,6 +20,7 @@ import {
   saveScan,
   saveResults,
   addSeen,
+  removeSeen,
   loadSeen,
   clearCache,
   type ScanSnapshot,
@@ -56,7 +57,7 @@ function mergeById<T extends { id?: string }>(prev: T[], next: T[]): T[] {
 
 export default function Dashboard() {
   const [cache, setCache] = useState<CacheState | null>(null);
-  const [loadingCache, setLoadingCache] = useState(true);
+  const [loadingCache, setLoadingCache] = useState(false);
 
   // Auth
   const [email, setEmail] = useState<string | null>(null);
@@ -81,6 +82,7 @@ export default function Dashboard() {
   const [log, setLog] = useState("");
   const [busy, setBusy] = useState(false);
   const [modelProgress, setModelProgress] = useState<ModelProgress | null>(null);
+  const sessionRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
@@ -88,19 +90,18 @@ export default function Dashboard() {
     setLog((prev) => (prev ? `${prev}\n${line}` : line));
   }, []);
 
-  const refreshCache = useCallback(async () => {
+  const refreshCache = useCallback(async (account: string, session: number) => {
+    if (sessionRef.current !== session) return;
     setLoadingCache(true);
     try {
-      setCache(await loadCache());
-    } catch (err) {
-      console.error(err);
+      const next = await loadCache(account);
+      if (sessionRef.current === session) setCache(next);
     } finally {
-      setLoadingCache(false);
+      if (sessionRef.current === session) setLoadingCache(false);
     }
   }, []);
 
   useEffect(() => {
-    refreshCache();
     detectCapability()
       .then((cap) => {
         setCapability(cap);
@@ -121,32 +122,55 @@ export default function Dashboard() {
   }, [log]);
 
   const onSignIn = useCallback(async () => {
+    const session = ++sessionRef.current;
+    abortRef.current?.abort();
+    setEmail(null);
+    setCache(null);
+    setLog("");
+    setBusy(false);
+    setModelProgress(null);
     setSigningIn(true);
     try {
       await signIn();
-      setEmail(await getProfileEmail());
+      if (session !== sessionRef.current) return;
+      const account = (await getProfileEmail()).trim().toLowerCase();
+      if (!account) throw new Error("Missing account identity");
+      if (session !== sessionRef.current) return;
+      setEmail(account);
+      await refreshCache(account, session);
     } catch (err) {
-      appendLog(`[sign-in error] ${(err as Error).message}`);
+      if (session === sessionRef.current) appendLog(`[sign-in error] ${(err as Error).message}`);
     } finally {
-      setSigningIn(false);
+      if (session === sessionRef.current) setSigningIn(false);
     }
-  }, [appendLog]);
+  }, [appendLog, refreshCache]);
 
   const onSignOut = useCallback(() => {
+    ++sessionRef.current;
+    abortRef.current?.abort();
     signOut();
+    setCache(null);
+    setLog("");
+    setBusy(false);
+    setSigningIn(false);
+    setLoadingCache(false);
+    setModelProgress(null);
     setEmail(null);
   }, []);
 
   const onScan = useCallback(async () => {
-    if (busy) return;
+    if (busy || loadingCache) return;
     if (!email) {
       appendLog("[!] Sign in with Google first.");
       return;
     }
+    const session = sessionRef.current;
+    const ac = new AbortController();
+    const current = () => session === sessionRef.current && !ac.signal.aborted;
+    const scanLog = (line: string) => { if (current()) appendLog(line); };
     setBusy(true);
     setLog("");
     setModelProgress(null);
-    const ac = new AbortController();
     abortRef.current = ac;
     try {
       // 1. Fetch the targeted Gmail queries (server-side filtered at Google).
@@ -155,29 +179,32 @@ export default function Dashboard() {
         days,
         maxResults: maxEmails,
         unreadOnly: !includeRead,
-        onLog: appendLog,
+        onLog: scanLog,
       });
       if (ac.signal.aborted) throw new DOMException("Aborted", "AbortError");
 
       // 2. Incremental: skip emails already analyzed in a previous run.
-      const seen = await loadSeen();
+      const seen = await loadSeen(email);
+      if (!current()) return;
       const seenSet = new Set(seen);
       const toAnalyze = rescan ? fetched : fetched.filter((e) => !seenSet.has(e.id));
       const skipped = fetched.length - toAnalyze.length;
       if (skipped > 0) {
-        appendLog(`Skipping ${skipped} email(s) already scanned; ${toAnalyze.length} new to analyze.`);
+        scanLog(`Skipping ${skipped} email(s) already scanned; ${toAnalyze.length} new to analyze.`);
       }
 
       // 3. Analyze (LLM two-pass, or the no-LLM fast path).
       let analyzed: ResultItem[] = [];
+      let successfulIds = toAnalyze.map((e) => e.id);
+      let failedIds: string[] = [];
       if (toAnalyze.length === 0) {
-        appendLog("No new emails since the last scan.");
+        scanLog("No new emails since the last scan.");
       } else if (fast) {
-        appendLog("Fast mode: rule-based full-body filter (no LLM).");
+        scanLog("Fast mode: rule-based full-body filter (no LLM).");
         analyzed = ruleBasedAnalyze(toAnalyze);
-        appendLog(`${analyzed.length} candidate(s) kept.`);
+        scanLog(`${analyzed.length} candidate(s) kept.`);
       } else {
-        analyzed = await analyze(toAnalyze, {
+        const outcome = await analyze(toAnalyze, {
           backend,
           webllmModel,
           ollamaUrl,
@@ -185,56 +212,68 @@ export default function Dashboard() {
           // Phones can't hold the full classification prompt in context; rules
           // take over relevance there and the model only extracts fields.
           lowMemory: backend === "webllm" && (capability?.mobile ?? false),
-          onLog: appendLog,
-          onModelProgress: setModelProgress,
+          onLog: scanLog,
+          onModelProgress: (p) => { if (current()) setModelProgress(p); },
           signal: ac.signal,
         });
+        analyzed = outcome.results;
+        successfulIds = outcome.successfulIds;
+        failedIds = outcome.failedIds;
       }
+      if (!current()) return;
       setModelProgress(null);
 
       // 4. Merge with prior cache + persist. On a full rescan, the current
       // window's kept-status is decided solely by this run (drop stale entries
       // for fetched emails); incremental runs keep prior results untouched
       // since seen emails are never re-evaluated.
-      const prevResults = cache?.results ?? [];
-      const prevEmails = cache?.scan?.emails ?? [];
-      const fetchedIds = new Set(fetched.map((e) => e.id));
-      const basis = rescan
-        ? prevResults.filter((r) => !(r.id && fetchedIds.has(r.id)))
-        : prevResults;
+      const previous = await loadCache(email);
+      if (!current()) return;
+      const prevResults = previous.results ?? [];
+      const prevEmails = previous.scan?.emails ?? [];
+      const evaluatedIds = new Set(successfulIds);
+      const basis = prevResults.filter((r) => !(r.id && evaluatedIds.has(r.id)));
       const mergedResults = mergeById(basis, analyzed);
-      const mergedEmails = mergeById(prevEmails, fetched.map(headerOf));
+      const mergedEmails = mergeById(prevEmails, toAnalyze.filter((e) => evaluatedIds.has(e.id)).map(headerOf));
       const snapshot: ScanSnapshot = {
         scan_time: new Date().toLocaleString(),
         emails: mergedEmails,
         kept_ids: mergedResults.map((r) => r.id ?? "").filter(Boolean),
       };
-      await saveResults(mergedResults);
-      await saveScan(snapshot);
-      await addSeen(fetched.map((e) => e.id));
-      await refreshCache();
+      await saveResults(email, mergedResults);
+      if (!current()) return;
+      await saveScan(email, snapshot);
+      if (!current()) return;
+      await removeSeen(email, failedIds);
+      if (!current()) return;
+      await addSeen(email, successfulIds);
+      await refreshCache(email, session);
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        appendLog(`[error] ${(err as Error).message}`);
+        scanLog(`[error] ${(err as Error).message}`);
       } else {
-        appendLog("[cancelled]");
+        scanLog("[cancelled]");
       }
     } finally {
-      setBusy(false);
-      abortRef.current = null;
+      if (session === sessionRef.current) {
+        setBusy(false);
+        abortRef.current = null;
+      }
     }
   }, [
-    busy, email, keyword, days, maxEmails, includeRead, fast, rescan, backend,
+    busy, loadingCache, email, keyword, days, maxEmails, includeRead, fast, rescan, backend,
     webllmModel, ollamaUrl, ollamaModel, cache, appendLog, refreshCache, capability,
   ]);
 
   const onCancel = useCallback(() => abortRef.current?.abort(), []);
 
   const onClearCache = useCallback(async () => {
-    await clearCache();
-    await refreshCache();
-    appendLog("Cache cleared.");
-  }, [refreshCache, appendLog]);
+    if (!email || busy) return;
+    const session = sessionRef.current;
+    await clearCache(email);
+    await refreshCache(email, session);
+    if (session === sessionRef.current) appendLog("Cache cleared.");
+  }, [refreshCache, appendLog, email, busy]);
 
   const keptIds = useMemo(() => new Set(cache?.scan?.kept_ids ?? []), [cache?.scan?.kept_ids]);
 
@@ -407,7 +446,7 @@ export default function Dashboard() {
           title={`Kept candidates${sortedResults.length ? ` (${sortedResults.length})` : ""}`}
           headerRight={
             <div className="flex gap-3">
-              <button onClick={refreshCache} className="text-xs text-[color:var(--color-muted)] hover:text-white">
+              <button onClick={() => { if (email) void refreshCache(email, sessionRef.current); }} className="text-xs text-[color:var(--color-muted)] hover:text-white">
                 {loadingCache ? "…" : "Refresh"}
               </button>
               <button onClick={onClearCache} className="text-xs text-[color:var(--color-muted)] hover:text-white">

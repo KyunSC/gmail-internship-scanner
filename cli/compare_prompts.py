@@ -64,6 +64,10 @@ def main():
     tight_results = analyze_with_ollama(emails, prompt_template=PROMPT_TIGHT)
     t_tight = time.time() - t0
 
+    print(f"Failed analyses: default={len(default_results.failed_ids)}, tight={len(tight_results.failed_ids)}")
+    common_success = default_results.successful_ids & tight_results.successful_ids
+    default_results = [r for r in default_results if r.get("id") in common_success]
+    tight_results = [r for r in tight_results if r.get("id") in common_success]
     default_ids = {r.get("id") for r in default_results if r.get("id")}
     tight_ids = {r.get("id") for r in tight_results if r.get("id")}
 

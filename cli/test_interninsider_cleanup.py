@@ -28,7 +28,7 @@ class InternInsiderCleanupTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()):
                     marked = clean_inbox(
                         service, results=[cache["retained"]], apply=True,
-                        email_cache=cache,
+                        email_cache=cache, evaluated_ids=set(cache),
                         keep_ids={"retained"} if use_ids else None,
                     )
                 self.assertIn("from:alerts@interninsider.me", messages.list.call_args.kwargs["q"])

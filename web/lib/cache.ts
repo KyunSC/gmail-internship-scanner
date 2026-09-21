@@ -15,6 +15,11 @@ const SCAN_KEY = "scan";
 const RESULTS_KEY = "results";
 const SEEN_KEY = "seen";
 
+function accountKey(account: string, key: string): string {
+  if (!account.trim()) throw new Error("Account identity required");
+  return `account:${encodeURIComponent(account.trim().toLowerCase())}:${key}`;
+}
+
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -68,39 +73,45 @@ async function idbDel(keys: string[]): Promise<void> {
 }
 
 // ── Scan snapshot + results ──────────────────────────────────────────────────
-export function saveScan(snapshot: ScanSnapshot): Promise<void> {
-  return idbSet(SCAN_KEY, snapshot);
+export function saveScan(account: string, snapshot: ScanSnapshot): Promise<void> {
+  return idbSet(accountKey(account, SCAN_KEY), snapshot);
 }
-export function loadScan(): Promise<ScanSnapshot | null> {
-  return idbGet<ScanSnapshot>(SCAN_KEY);
+export function loadScan(account: string): Promise<ScanSnapshot | null> {
+  return idbGet<ScanSnapshot>(accountKey(account, SCAN_KEY));
 }
-export function saveResults(results: ResultItem[]): Promise<void> {
-  return idbSet(RESULTS_KEY, results);
+export function saveResults(account: string, results: ResultItem[]): Promise<void> {
+  return idbSet(accountKey(account, RESULTS_KEY), results);
 }
-export function loadResults(): Promise<ResultItem[] | null> {
-  return idbGet<ResultItem[]>(RESULTS_KEY);
+export function loadResults(account: string): Promise<ResultItem[] | null> {
+  return idbGet<ResultItem[]>(accountKey(account, RESULTS_KEY));
 }
 
-export async function loadCache(): Promise<{ scan: ScanSnapshot | null; results: ResultItem[] | null }> {
-  const [scan, results] = await Promise.all([loadScan(), loadResults()]);
+export async function loadCache(account: string): Promise<{ scan: ScanSnapshot | null; results: ResultItem[] | null }> {
+  const [scan, results] = await Promise.all([loadScan(account), loadResults(account)]);
   return { scan, results };
 }
 
-export function clearCache(): Promise<void> {
-  return idbDel([SCAN_KEY, RESULTS_KEY, SEEN_KEY]);
+export function clearCache(account: string): Promise<void> {
+  return idbDel([SCAN_KEY, RESULTS_KEY, SEEN_KEY].map((key) => accountKey(account, key)));
 }
 
 // ── Incremental seen-set (skip already-scanned emails) ───────────────────────
-export function loadSeen(): Promise<string[]> {
-  return idbGet<string[]>(SEEN_KEY).then((v) => v ?? []);
+export function loadSeen(account: string): Promise<string[]> {
+  return idbGet<string[]>(accountKey(account, SEEN_KEY)).then((v) => v ?? []);
 }
 
 /** Append new message ids, dedupe, and cap to the most recent SEEN_CAP. */
-export async function addSeen(ids: string[]): Promise<void> {
-  const existing = await loadSeen();
+export async function addSeen(account: string, ids: string[]): Promise<void> {
+  const existing = await loadSeen(account);
   const known = new Set(existing);
   const fresh = ids.filter((id) => !known.has(id));
   if (fresh.length === 0) return;
   const merged = [...existing, ...fresh].slice(-SEEN_CAP);
-  await idbSet(SEEN_KEY, merged);
+  await idbSet(accountKey(account, SEEN_KEY), merged);
+}
+
+/** Failed rescans retain prior display decisions but must remain retryable. */
+export async function removeSeen(account: string, ids: string[]): Promise<void> {
+  const failed = new Set(ids);
+  await idbSet(accountKey(account, SEEN_KEY), (await loadSeen(account)).filter((id) => !failed.has(id)));
 }

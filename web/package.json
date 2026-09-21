@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "node --test tests/*.cjs"
   },
   "dependencies": {
     "@mlc-ai/web-llm": "^0.2.84",

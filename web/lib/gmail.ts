@@ -3,7 +3,7 @@
 // Runs entirely in the browser against the Gmail REST API with the user's
 // in-browser OAuth token — no backend.
 
-import { getAccessToken } from "@/lib/google-auth";
+import { getAccessToken, authGeneration } from "@/lib/google-auth";
 
 export type GmailMessage = {
   id: string;
@@ -107,13 +107,15 @@ function extractBody(payload: GmailPart): string {
 }
 
 // ── REST helpers ─────────────────────────────────────────────────────────────
-async function gfetch(path: string): Promise<Response> {
+async function gfetch(path: string, epoch = authGeneration()): Promise<Response> {
+  if (epoch !== authGeneration()) throw new Error("Account changed");
   const token = await getAccessToken();
+  if (epoch !== authGeneration()) throw new Error("Account changed");
   return fetch(`${API}${path}`, { headers: { Authorization: `Bearer ${token}` } });
 }
 
-async function listMessageIds(query: string, maxResults: number): Promise<string[]> {
-  const res = await gfetch(`/messages?q=${encodeURIComponent(query)}&maxResults=${maxResults}`);
+async function listMessageIds(query: string, maxResults: number, epoch: number): Promise<string[]> {
+  const res = await gfetch(`/messages?q=${encodeURIComponent(query)}&maxResults=${maxResults}`, epoch);
   if (!res.ok) {
     if (res.status === 401) throw new Error("Gmail authorization expired — sign in again.");
     throw new Error(`Gmail search failed (${res.status})`);
@@ -122,8 +124,8 @@ async function listMessageIds(query: string, maxResults: number): Promise<string
   return (data.messages ?? []).map((m) => m.id);
 }
 
-async function getMessage(id: string): Promise<GmailMessage | null> {
-  const res = await gfetch(`/messages/${id}?format=full`);
+async function getMessage(id: string, epoch: number): Promise<GmailMessage | null> {
+  const res = await gfetch(`/messages/${id}?format=full`, epoch);
   if (!res.ok) return null;
   const msg = (await res.json()) as {
     payload?: GmailPart & { headers?: Array<{ name: string; value: string }> };
@@ -165,12 +167,12 @@ function formatCutoff(days: number): string {
   return `${y}/${m}/${day}`;
 }
 
-function buildQueries(keyword: string, days: number, unreadOnly: boolean): string[] {
+export function buildQueries(keyword: string, days: number, unreadOnly: boolean): string[] {
+  const cutoff = formatCutoff(days);
   let queries: string[];
   if (keyword.trim()) {
-    queries = [`${keyword} (${INTERN_TERMS})`];
+    queries = [`(${keyword}) (${INTERN_TERMS}) after:${cutoff}`];
   } else {
-    const cutoff = formatCutoff(days);
     queries = [
       `(${INTERN_TERMS}) after:${cutoff}`,
       `subject:(application OR applied OR interview OR offer) after:${cutoff}`,
@@ -199,13 +201,14 @@ export async function getProfileEmail(): Promise<string> {
 /** Run the targeted searches, dedupe by id, and fetch full bodies. */
 export async function runGmailSearch(opts: SearchOptions = {}): Promise<GmailMessage[]> {
   const { keyword = "", days = 30, unreadOnly = true, maxResults = 100, onLog } = opts;
+  const epoch = authGeneration();
   const queries = buildQueries(keyword, days, unreadOnly);
 
   const ids = new Set<string>();
   for (const q of queries) {
     onLog?.(`Searching: ${q}`);
     try {
-      for (const id of await listMessageIds(q, maxResults)) ids.add(id);
+      for (const id of await listMessageIds(q, maxResults, epoch)) ids.add(id);
     } catch (e) {
       onLog?.(`  [!] ${(e as Error).message}`);
     }
@@ -216,7 +219,7 @@ export async function runGmailSearch(opts: SearchOptions = {}): Promise<GmailMes
   const byId = new Map<string, GmailMessage>();
   let done = 0;
   await mapLimit(idList, 5, async (id) => {
-    const m = await getMessage(id).catch(() => null);
+    const m = await getMessage(id, epoch).catch(() => null);
     done += 1;
     if (m) byId.set(id, m);
     if (done % 10 === 0 || done === idList.length) onLog?.(`  Fetched ${done}/${idList.length}`);

@@ -147,7 +147,7 @@ function buildEmailText(emails: GmailMessage[], offset: number): string {
 // ── Response parsing (mirror _extract_results_array + _normalize_result) ─────
 function extractResultsArray(parsed: unknown): unknown[] {
   if (Array.isArray(parsed)) return parsed;
-  if (!parsed || typeof parsed !== "object") return [];
+  if (!parsed || typeof parsed !== "object") throw new Error("Missing results array");
   const obj = parsed as Record<string, unknown>;
   for (const key of ["results", "jobs", "emails", "items", "data", "matches"]) {
     if (Array.isArray(obj[key])) return obj[key] as unknown[];
@@ -156,7 +156,7 @@ function extractResultsArray(parsed: unknown): unknown[] {
     if (Array.isArray(val) && val.length && typeof val[0] === "object") return val as unknown[];
   }
   if (["subject", "job_title", "email_index"].some((k) => k in obj)) return [obj];
-  return [];
+  throw new Error("Missing results array");
 }
 
 function normalizeResult(item: unknown): ResultItem {
@@ -455,7 +455,10 @@ async function analyzeLowMemory(
   return postFilterResults(base, emails);
 }
 
-export async function analyze(emails: GmailMessage[], opts: AnalyzeOptions): Promise<ResultItem[]> {
+export type AnalysisOutcome = { results: ResultItem[]; successfulIds: string[]; failedIds: string[] };
+
+export async function analyze(emails: GmailMessage[], opts: AnalyzeOptions): Promise<AnalysisOutcome> {
+  const failedIds = new Set<string>();
   const { onLog, onProgress, signal } = opts;
 
   // Pre-filter: only analyze emails with an internship signal.
@@ -469,12 +472,19 @@ export async function analyze(emails: GmailMessage[], opts: AnalyzeOptions): Pro
   const sorted = [...filteredIn].sort((a, b) => (a.id ?? "").localeCompare(b.id ?? ""));
   if (sorted.length === 0) {
     onLog?.("No emails to analyze.");
-    return [];
+    return { results: [], successfulIds: emails.map((e) => e.id), failedIds: [] };
   }
 
-  const generate = await makeGenerate(opts);
+  let generate: GenerateFn;
+  try {
+    generate = await makeGenerate(opts);
+  } catch (error) {
+    onLog?.(`[!] Model unavailable: ${(error as Error).message}`);
+    const failed = new Set(sorted.map((e) => e.id));
+    return { results: [], successfulIds: emails.filter((e) => !failed.has(e.id)).map((e) => e.id), failedIds: [...failed] };
+  }
 
-  if (opts.lowMemory) return analyzeLowMemory(sorted, generate, opts);
+  if (opts.lowMemory) return { results: await analyzeLowMemory(sorted, generate, opts), successfulIds: emails.map((e) => e.id), failedIds: [] };
 
   const results: ResultItem[] = [];
   const total = sorted.length; // BATCH_SIZE = 1
@@ -492,8 +502,18 @@ export async function analyze(emails: GmailMessage[], opts: AnalyzeOptions): Pro
       let passResults: ResultItem[];
       try {
         const raw = await generate(prompt, temp, MAX_TOKENS);
-        passResults = extractResultsArray(JSON.parse(raw)).map(normalizeResult);
+        const items = extractResultsArray(JSON.parse(raw));
+        if (items.some((item) => !item || typeof item !== "object" ||
+          !("email_index" in item || "index" in item || "subject" in item || "job_title" in item))) {
+          throw new Error("Malformed classification item");
+        }
+        passResults = items.map(normalizeResult);
+        for (const r of passResults) {
+          if (r.email_index !== offset && r.subject !== sorted[b].subject) throw new Error("Unknown source email");
+          r.email_index = offset;
+        }
       } catch (e) {
+        failedIds.add(sorted[b].id);
         onLog?.(`  [!] pass failed, skipping: ${(e as Error).message}`);
         continue;
       }
@@ -506,12 +526,13 @@ export async function analyze(emails: GmailMessage[], opts: AnalyzeOptions): Pro
         batchCombined.push(r);
       }
     }
-    results.push(...batchCombined);
+    if (!failedIds.has(sorted[b].id)) results.push(...batchCombined);
     onProgress?.((b + 1) / total);
   }
 
   // Validate against the real emails (mirror the safety-filter tail).
   const final = postFilterResults(results, sorted);
   onLog?.(`${final.length} candidate(s) kept.`);
-  return final;
+  onLog?.(`${failedIds.size} failed email(s) remain eligible for retry.`);
+  return { results: final, successfulIds: emails.filter((e) => !failedIds.has(e.id)).map((e) => e.id), failedIds: [...failedIds] };
 }

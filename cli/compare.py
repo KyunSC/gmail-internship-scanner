@@ -95,7 +95,7 @@ def main():
 
     # ── Cache: skip already-analyzed emails ─────────────────────────────────
     cached = load_scan_cache() or {}
-    seen_ids = {e.get("id") for e in cached.get("emails", []) if e.get("id")}
+    seen_ids = {e.get("id") for e in cached.get("emails", []) if e.get("id")} - set(cached.get("failed_ids", []))
     if seen_ids:
         fresh = [e for e in emails if e.get("id") not in seen_ids]
         skipped = len(emails) - len(fresh)
@@ -105,15 +105,6 @@ def main():
 
     if not emails:
         print("  No new emails since the last scan.\n")
-        # Nothing new to analyze, but still run cleanup against the accumulated
-        # cache so the keep-set logic (and newly-cleanable senders) still apply.
-        email_cache = {e["id"]: e for e in cached.get("emails", []) if e.get("id")}
-        marked = clean_inbox(
-            service, days=args.days, apply=args.apply,
-            email_cache=email_cache, keep_ids=set(cached.get("kept_ids", [])),
-        )
-        if marked:
-            save_scan_cache(marked, [])
         return
 
     # ── Rule-based (full body, no LLM) ──────────────────────────────────────
@@ -147,7 +138,7 @@ def main():
     print_email_list(llm_results, "LLM-BASED (scanner pipeline)", color="\033[32m")
 
     # ── Diff ────────────────────────────────────────────────────────────────
-    only_rule = [e for e in rule_kept    if e["id"] not in llm_ids]
+    only_rule = [e for e in rule_kept    if e["id"] in llm_results.successful_ids and e["id"] not in llm_ids]
     only_llm  = [r for r in llm_results  if r.get("id") and r["id"] not in rule_ids]
     in_both   = [e for e in rule_kept    if e["id"] in llm_ids]
 
@@ -172,31 +163,18 @@ def main():
 
     print(f"\n{BOLD}{'='*70}{RESET}\n")
 
-    # ── Save cache ───────────────────────────────────────────────────────────
-    # Merge this run's emails + LLM-surfaced ids into the accumulated cache so
-    # the next compare run (and scanner.py) skips these emails.
-    # Persist the union from both pipelines. A rule-only result is deliberately
-    # kept unread by cleanup, so it must also remain in the cached keep-set on
-    # later runs where there are no fresh emails to analyze.
-    cache = save_scan_cache(emails, [*llm_results, *rule_kept])
+    # Persist only completed evaluations. Failed reanalyses retain prior decisions.
+    evaluated = [e for e in emails if e["id"] in llm_results.successful_ids]
+    cache = save_scan_cache(evaluated, [*llm_results, *rule_kept], failed_ids=llm_results.failed_ids)
 
-    # ── Cleanup ─────────────────────────────────────────────────────────────
-    # Mark aggregator emails as read when BOTH pipelines agreed they're not
-    # internships. Keep set = union of what either pipeline surfaced (any
-    # disagreement is treated as "keep unread" — safety bias). Emails outside
-    # the fetched set still pass through clean_inbox's normal subject safety net.
+    # Both pipelines must successfully agree before current-scan cleanup.
     keep_ids = rule_ids | llm_ids | set(cache.get("kept_ids", []))
     email_cache = {e["id"]: e for e in cache.get("emails", []) if e.get("id")}
-    marked = clean_inbox(
+    clean_inbox(
         service, days=args.days, apply=args.apply,
         email_cache=email_cache, keep_ids=keep_ids,
+        evaluated_ids=llm_results.successful_ids,
     )
-    # Fold the emails we just marked read into the seen-set so they're tracked
-    # like analyzed emails (and skipped by future runs). Not added to kept_ids —
-    # they were the noise we cleared, not internships.
-    if marked:
-        save_scan_cache(marked, [])
-
 
 
 if __name__ == "__main__":

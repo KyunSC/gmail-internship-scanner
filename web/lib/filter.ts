@@ -93,11 +93,15 @@ const STAGE_WORD_RE = /\bstages?\b/i;
 
 // ── Digest splitting ─────────────────────────────────────────────────────────
 function cleanGlassdoorBody(body: string): string {
+  const original = body;
   const head = GLASSDOOR_HEAD_RE.exec(body);
   if (head) {
     body = body.slice(head.index + head[0].length);
-    const star = body.indexOf("★");
-    if (star >= 0) body = body.slice(star + 1);
+    const alert = /Job alert:\s*(.+?)\s+Your job listings for/i.exec(original)?.[1]?.trim();
+    const rest = body.trimStart();
+    if (alert && rest.slice(0, alert.length).toLowerCase() === alert.toLowerCase()) {
+      body = rest.slice(alert.length).replace(/^\s*(?:[\w.'’&-]+(?:\s+[\w.'’&-]+){0,3},\s*[A-Z]{2}|remote)\b/i, "");
+    }
   }
   const foot = GLASSDOOR_FOOT_RE.exec(body);
   if (foot) body = body.slice(0, foot.index);

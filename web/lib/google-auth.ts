@@ -45,7 +45,8 @@ let tokenClient: TokenClient | null = null;
 let accessToken: string | null = null;
 let tokenExpiry = 0; // epoch ms
 let gisLoaded: Promise<void> | null = null;
-let pending: { resolve: (t: string) => void; reject: (e: Error) => void } | null = null;
+let pending: { promise: Promise<string>; reject: (e: Error) => void } | null = null;
+let generation = 0;
 
 function loadGis(): Promise<void> {
   if (gisLoaded) return gisLoaded;
@@ -63,35 +64,6 @@ function loadGis(): Promise<void> {
   return gisLoaded;
 }
 
-async function ensureClient(): Promise<TokenClient> {
-  await loadGis();
-  const oauth2 = window.google?.accounts?.oauth2;
-  if (!oauth2) throw new Error("Google Identity Services unavailable");
-  if (!tokenClient) {
-    tokenClient = oauth2.initTokenClient({
-      client_id: GOOGLE_CLIENT_ID,
-      scope: GMAIL_READONLY,
-      callback: (resp: TokenResponse) => {
-        const p = pending;
-        pending = null;
-        if (resp.error || !resp.access_token) {
-          p?.reject(new Error(resp.error_description || resp.error || "Authorization failed"));
-          return;
-        }
-        accessToken = resp.access_token;
-        tokenExpiry = Date.now() + Number(resp.expires_in ?? 3600) * 1000;
-        p?.resolve(accessToken);
-      },
-      error_callback: (err) => {
-        const p = pending;
-        pending = null;
-        p?.reject(new Error(err?.message || "Authorization popup closed or blocked"));
-      },
-    });
-  }
-  return tokenClient;
-}
-
 /** True if a client_id was configured at build time. */
 export function isConfigured(): boolean {
   return GOOGLE_CLIENT_ID.length > 0;
@@ -103,19 +75,52 @@ export function hasValidToken(): boolean {
 }
 
 function requestToken(prompt: "" | "none" | "consent"): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    if (!isConfigured()) {
-      reject(new Error("Missing NEXT_PUBLIC_GOOGLE_CLIENT_ID — see web/.env.local.example"));
-      return;
+  if (pending) return pending.promise;
+  const epoch = generation;
+  let resolve!: (token: string) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<string>((ok, fail) => { resolve = ok; reject = fail; });
+  const request = { promise, reject };
+  pending = request;
+  const fail = (error: Error) => {
+    if (pending !== request) return;
+    pending = null;
+    reject(error);
+  };
+  void (async () => {
+    try {
+      if (!isConfigured()) throw new Error("Missing NEXT_PUBLIC_GOOGLE_CLIENT_ID");
+      await loadGis();
+      if (generation !== epoch || pending !== request) return;
+      const oauth2 = window.google?.accounts?.oauth2;
+      if (!oauth2) throw new Error("Google Identity Services unavailable");
+      tokenClient = oauth2.initTokenClient({
+        client_id: GOOGLE_CLIENT_ID,
+        scope: GMAIL_READONLY,
+        callback: (resp) => {
+          if (generation !== epoch || pending !== request) return;
+          if (resp.error || !resp.access_token) {
+            fail(new Error(resp.error_description || resp.error || "Authorization failed"));
+            return;
+          }
+          accessToken = resp.access_token;
+          tokenExpiry = Date.now() + Number(resp.expires_in ?? 3600) * 1000;
+          pending = null;
+          resolve(accessToken);
+        },
+        error_callback: (err) => fail(new Error(err.message || "Authorization popup closed or blocked")),
+      });
+      tokenClient.requestAccessToken({ prompt });
+    } catch (error) {
+      gisLoaded = null;
+      fail(error instanceof Error ? error : new Error(String(error)));
     }
-    ensureClient()
-      .then((client) => {
-        pending = { resolve, reject };
-        client.requestAccessToken({ prompt });
-      })
-      .catch(reject);
-  });
+  })();
+  return promise;
 }
+
+// Requests and scans use this to reject work from a previous signed-in session.
+export function authGeneration(): number { return generation; }
 
 /** Interactive sign-in (shows the Google account/consent popup as needed). */
 export function signIn(): Promise<string> {
@@ -124,22 +129,26 @@ export function signIn(): Promise<string> {
 
 /**
  * Return a valid access token, reusing the cached one when possible and
- * silently refreshing otherwise. Falls back to an interactive prompt if the
- * silent refresh fails (e.g. first call of the session).
+ * silently refreshing otherwise. On failure all callers reject together; the
+ * user can sign in again and subsequent requests can retry.
  */
-export async function getAccessToken(): Promise<string> {
-  if (hasValidToken()) return accessToken as string;
-  try {
-    return await requestToken("none");
-  } catch {
-    return requestToken("");
-  }
+export function getAccessToken(): Promise<string> {
+  if (hasValidToken()) return Promise.resolve(accessToken as string);
+  return requestToken("none");
 }
 
 /** Revoke the current token and clear local state. */
 export function signOut(): void {
-  const oauth2 = window.google?.accounts?.oauth2;
-  if (accessToken && oauth2) oauth2.revoke(accessToken);
+  const revokedToken = accessToken;
+  generation += 1;
+  pending?.reject(new Error("Signed out"));
+  pending = null;
+  tokenClient = null;
   accessToken = null;
   tokenExpiry = 0;
+  // Local sign-out must complete even if revocation is unavailable.
+  const oauth2 = window.google?.accounts?.oauth2;
+  if (revokedToken && oauth2) {
+    try { oauth2.revoke(revokedToken); } catch { /* already signed out locally */ }
+  }
 }

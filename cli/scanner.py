@@ -280,12 +280,12 @@ def search_emails(service, query: str, max_results: int = 100) -> list[dict]:
 def run_gmail_search(service, keyword: str = "", days: int = 30, unread_only: bool = True, max_results: int = 100) -> list[dict]:
     """Run multiple targeted searches and deduplicate results."""
     intern_terms = "intern OR internship OR coop OR co-op OR stage OR stagiaire OR student"
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
     if keyword.strip():
         queries = [
-            f"{keyword} ({intern_terms})",
+            f"({keyword}) ({intern_terms}) after:{cutoff}",
         ]
     else:
-        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
         queries = [
             f"({intern_terms}) after:{cutoff}",
             f"subject:(application OR applied OR interview OR offer) after:{cutoff}",
@@ -524,7 +524,10 @@ def _analyze_batch(
         timeout=180,
     )
     r.raise_for_status()
-    raw = r.json().get("response", "").strip()
+    response = r.json()
+    if not isinstance(response, dict) or not isinstance(response.get("response"), str):
+        raise ValueError("Missing model response")
+    raw = response["response"].strip()
     if DEBUG:
         print(f"\n  ----- RAW LLM RESPONSE (emails {offset}-{offset + len(emails) - 1}) -----")
         print(f"  {raw}")
@@ -532,7 +535,17 @@ def _analyze_batch(
     parsed = json.loads(raw)
     items = _extract_results_array(parsed)
     # Normalize field names that the model sometimes invents
-    return [_normalize_result(item) for item in items]
+    if any(not isinstance(item, dict) or not any(k in item for k in ("email_index", "index", "subject", "job_title")) for item in items):
+        raise ValueError("Malformed classification item")
+    normalized = [_normalize_result(item) for item in items]
+    for item in normalized:
+        idx = item.get("email_index")
+        if not (isinstance(idx, int) and offset <= idx < offset + len(emails)):
+            matches = [offset + i for i, e in enumerate(emails) if e["subject"] == item.get("subject")]
+            if len(matches) != 1:
+                raise ValueError("Classification does not identify an input email")
+            item["email_index"] = matches[0]
+    return normalized
 
 
 def _extract_results_array(parsed) -> list:
@@ -540,7 +553,7 @@ def _extract_results_array(parsed) -> list:
     if isinstance(parsed, list):
         return parsed
     if not isinstance(parsed, dict):
-        return []
+        raise ValueError("Missing classification results array")
     # Common keys the model might pick
     for key in ("results", "jobs", "emails", "items", "data", "matches"):
         val = parsed.get(key)
@@ -553,7 +566,7 @@ def _extract_results_array(parsed) -> list:
     # Maybe the model returned a single object instead of an array
     if any(k in parsed for k in ("subject", "job_title", "email_index")):
         return [parsed]
-    return []
+    raise ValueError("Missing classification results array")
 
 
 VALID_CATEGORIES = {"internship", "recruiter", "confirmation", "reply", "status"}
@@ -1110,10 +1123,13 @@ def _split_aggregator_listings(sender: str, body: str, subject: str = "") -> lis
         if chunks:
             return chunks
     # LinkedIn closes each card with a run of badges rather than a single CTA.
-    # Non-digest LinkedIn mail (invitations, profile-view nudges, post
-    # notifications) carries no badge run and falls through to the whole-body
-    # chunk, which is why the marker is part of the guard.
-    if "linkedin.com" in s and _LINKEDIN_CARD_SEP_RE.search(body):
+    # Job-alert senders can carry badge-free cards. Require a location separator
+    # and a structural card end, rather than interpreting arbitrary LinkedIn mail.
+    linkedin_jobs = any(addr in s for addr in (
+        "jobalerts-noreply@linkedin.com", "jobs-listings@linkedin.com", "jobs-noreply@linkedin.com",
+    ))
+    if "linkedin.com" in s and (_LINKEDIN_CARD_SEP_RE.search(body) or
+                                (linkedin_jobs and "·" in body and _LINKEDIN_CARD_END_RE.search(body))):
         return _split_linkedin_cards(_clean_linkedin_body(subject, body)) or [body]
     return [body]
 
@@ -1353,11 +1369,19 @@ BATCH_SIZE = 1
 LLM_PASS_TEMPERATURES = (0.0, 0.5)
 
 
+class AnalysisResults(list):
+    """List-compatible results with explicit completion status for every email."""
+    def __init__(self, results=(), successful_ids=(), failed_ids=()):
+        super().__init__(results)
+        self.successful_ids = set(successful_ids)
+        self.failed_ids = set(failed_ids)
+
+
 def analyze_with_ollama(
     emails: list[dict],
     prompt_template: str = PROMPT_DEFAULT,
     prefilter: bool = True,
-) -> list[dict]:
+) -> AnalysisResults:
     """Send email metadata to Ollama for classification and summarization in batches.
 
     prefilter=True runs the keyword/term rules before the LLM, so only plausible
@@ -1367,8 +1391,10 @@ def analyze_with_ollama(
     rule arm rather than a subset of it.
     """
     if not emails:
-        return []
+        return AnalysisResults()
 
+    input_ids = {e["id"] for e in emails}
+    failed_ids = set()
     if prefilter:
         signaled = [
             e for e in emails
@@ -1394,7 +1420,7 @@ def analyze_with_ollama(
     emails = sorted(filtered_in, key=lambda e: e.get("id", ""))
 
     if not emails:
-        return []
+        return AnalysisResults(successful_ids=input_ids)
 
     results: list[dict] = []
     total_batches = (len(emails) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -1409,6 +1435,7 @@ def analyze_with_ollama(
         # flagged; results that only one pass produced (the recall win) are kept.
         batch_combined: list[dict] = []
         seen_in_batch: set[int] = set()
+        batch_failed = False
         for p, temp in enumerate(LLM_PASS_TEMPERATURES):
             pass_label = f" pass {p+1}/{n_passes} (t={temp})" if n_passes > 1 else ""
             print(f"  Batch {b+1}/{total_batches} (emails {start+1}-{end}){pass_label}...")
@@ -1417,11 +1444,13 @@ def analyze_with_ollama(
                     batch, offset=start + 1, temperature=temp,
                     prompt_template=prompt_template,
                 )
-            except json.JSONDecodeError as e:
+            except (ValueError, TypeError, KeyError) as e:
                 print(f"  [!] Batch {b+1}{pass_label} parse failed, skipping: {e}")
+                batch_failed = True
                 continue
             except requests.RequestException as e:
                 print(f"  [!] Batch {b+1}{pass_label} request failed, skipping: {e}")
+                batch_failed = True
                 continue
             for r in pass_results:
                 idx = r.get("email_index")
@@ -1430,7 +1459,10 @@ def analyze_with_ollama(
                         continue
                     seen_in_batch.add(idx)
                 batch_combined.append(r)
-        results.extend(batch_combined)
+        if batch_failed:
+            failed_ids.update(e["id"] for e in batch)
+        else:
+            results.extend(batch_combined)
 
     # Build subject lookup for fallback when email_index is missing
     by_subject: dict[str, dict] = {}
@@ -1525,7 +1557,9 @@ def analyze_with_ollama(
     if dropped_unmatched:
         print(f"  Filtered out {dropped_unmatched} unmatched result(s) (LLM hallucination)")
 
-    return filtered
+    if failed_ids:
+        print(f"  [!] {len(failed_ids)} email(s) failed analysis; left unchanged and eligible for retry")
+    return AnalysisResults(filtered, input_ids - failed_ids, failed_ids)
 
 
 def rule_based_analyze(emails: list[dict]) -> list[dict]:
@@ -1646,7 +1680,7 @@ def export_json(results: list[dict], path: str):
 
 # ── Scan cache ──────────────────────────────────────────────────────────────
 
-def save_scan_cache(emails: list[dict], results: list[dict], merge: bool = True) -> dict:
+def save_scan_cache(emails: list[dict], results: list[dict], merge: bool = True, failed_ids=()) -> dict:
     """Persist this scan and return the resulting cache payload.
 
     We only store header-level fields (no bodies) to keep the file small and
@@ -1658,16 +1692,20 @@ def save_scan_cache(emails: list[dict], results: list[dict], merge: bool = True)
     cache so the seen set grows across runs. The email list is capped at
     SEEN_CACHE_MAX, dropping the oldest records first; kept_ids are pruned to ids
     still present in that capped set so they stay bounded too."""
+    successful_ids = getattr(results, "successful_ids", {e["id"] for e in emails})
+    failed_ids = set(failed_ids) | getattr(results, "failed_ids", set())
+    emails = [e for e in emails if e["id"] in successful_ids]
     emails_min = [
         {"id": e.get("id", ""), "subject": e.get("subject", ""),
          "from": e.get("from", ""), "date": e.get("date", "")}
         for e in emails if e.get("id")
     ]
-    kept_ids = [r.get("id") for r in results if r.get("id")]
+    kept_ids = [r.get("id") for r in results if r.get("id") in successful_ids]
 
     existing = (load_scan_cache() or {}) if merge else {}
     prev_emails = existing.get("emails", []) or []
-    prev_kept = existing.get("kept_ids", []) or []
+    prev_kept = [eid for eid in existing.get("kept_ids", []) if eid not in successful_ids]
+    retry_ids = (set(existing.get("failed_ids", [])) | failed_ids) - successful_ids
 
     # Merge emails by id, preserving order (oldest first) so the cap drops the
     # oldest. A re-seen id keeps its slot but refreshes its stored metadata.
@@ -1691,6 +1729,7 @@ def save_scan_cache(emails: list[dict], results: list[dict], merge: bool = True)
         "scan_time": datetime.now().isoformat(timespec="seconds"),
         "emails": merged_emails,
         "kept_ids": merged_kept,
+        "failed_ids": sorted(retry_ids),
     }
     CACHE_PATH.write_text(json.dumps(payload))
     return payload
@@ -1720,21 +1759,23 @@ def clear_scan_cache() -> list[str]:
 
 def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
                 apply: bool = False, email_cache: dict | None = None,
-                keep_ids: set[str] | None = None):
+                keep_ids: set[str] | None = None,
+                evaluated_ids: set[str] | None = None, from_cache: bool = False,
+                failed_ids: set[str] | None = None):
     """Mark unread emails from job-aggregator senders as read IF they're not in
     the scanner's results. Aggregator emails the scanner surfaced stay unread.
 
     email_cache: optional dict mapping message-id -> email dict (from run_gmail_search),
     used to skip individual metadata API calls for already-fetched emails.
 
-    keep_ids: when provided (--from-cache path), match the keep set by message ID
-    rather than the (sender, date) tuple derived from `results`. New arrivals
-    not in the cache are still processed by the standard rules (surfaced /
-    subject safety net) because the query already restricts to known aggregator
-    senders.
+    evaluated_ids: only successful classifications from the current scan may be
+    cleaned normally. Missing/failed/unfetched messages are left untouched.
+    from_cache: explicit opt-in to broader cleanup using cached keep decisions
+    and subject safety checks. This trades freshness for speed; failed_ids are
+    still excluded. Broad cleanup does not count as a completed analysis.
+    keep_ids: match the keep set by message ID rather than sender/date.
 
-    Returns the list of emails actually marked read (empty on dry-run or when
-    there's nothing to mark) so callers can fold them into the scan cache.
+    Returns emails actually marked read (empty for dry runs).
     """
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
     sender_clauses = " OR ".join(f"from:{s}" for s in CLEAN_INBOX_SENDERS)
@@ -1774,6 +1815,10 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
     cache_hits = 0
     for meta in candidates:
         msg_id = meta["id"]
+        if msg_id in (failed_ids or set()):
+            continue
+        if not from_cache and msg_id not in (evaluated_ids or set()):
+            continue
         # All candidates here are from known aggregator senders (the query
         # restricts to CLEAN_INBOX_SENDERS), so we trust the standard "surfaced
         # + subject safety net" rules even for new arrivals that weren't in the
@@ -1959,14 +2004,10 @@ def main():
         service = get_gmail_service(write_access=True)
         email_cache = {e["id"]: e for e in cached.get("emails", []) if e.get("id")}
         keep_ids = set(cached.get("kept_ids", []))
-        marked = clean_inbox(
+        clean_inbox(
             service, days=args.days, apply=args.apply, email_cache=email_cache,
-            keep_ids=keep_ids,
+            keep_ids=keep_ids, from_cache=True, failed_ids=set(cached.get("failed_ids", [])),
         )
-        # Fold the emails we just marked read into the seen-set so they're
-        # tracked like analyzed emails. Not added to kept_ids — they're noise.
-        if marked:
-            save_scan_cache(marked, [])
         return
 
     # Check Ollama (unless --fast, which skips the LLM entirely)
@@ -1998,7 +2039,7 @@ def main():
     # arrivals. The cache accumulates every email it has seen; --rescan forces a
     # full re-analysis of everything the queries returned.
     cached = load_scan_cache() or {}
-    seen_ids = {e.get("id") for e in cached.get("emails", []) if e.get("id")}
+    seen_ids = {e.get("id") for e in cached.get("emails", []) if e.get("id")} - set(cached.get("failed_ids", []))
     if not args.rescan and seen_ids:
         fresh = [e for e in emails if e.get("id") not in seen_ids]
         skipped = len(emails) - len(fresh)
@@ -2008,16 +2049,6 @@ def main():
 
     if not emails:
         print("\n  No new emails since the last scan.\n")
-        # Nothing new to analyze, but still clear inbox noise if asked — use the
-        # accumulated surfaced set (same keep logic as --from-cache).
-        if args.clean_inbox:
-            email_cache = {e["id"]: e for e in cached.get("emails", []) if e.get("id")}
-            marked = clean_inbox(
-                service, days=args.days, apply=args.apply,
-                email_cache=email_cache, keep_ids=set(cached.get("kept_ids", [])),
-            )
-            if marked:
-                save_scan_cache(marked, [])
         return
 
     # Analyze
@@ -2043,12 +2074,11 @@ def main():
     # ids so emails surfaced in earlier runs — skipped this time — stay unread.
     if args.clean_inbox:
         email_cache = {e["id"]: e for e in cache.get("emails", []) if e.get("id")}
-        marked = clean_inbox(
+        clean_inbox(
             service, days=args.days, apply=args.apply,
             email_cache=email_cache, keep_ids=set(cache.get("kept_ids", [])),
+            evaluated_ids=getattr(results, "successful_ids", {e["id"] for e in emails}),
         )
-        if marked:
-            save_scan_cache(marked, [])
 
 
 if __name__ == "__main__":

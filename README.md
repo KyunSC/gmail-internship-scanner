@@ -168,7 +168,7 @@ python scanner.py        # first run: analyzes everything in the window
 python scanner.py        # later run: "Skipping N email(s) already scanned; M new to analyze"
 ```
 
-The seen-set accumulates across runs (capped at 5000 records, oldest dropped first), so emails stay skipped even if they're still unread. If nothing new has arrived, the scan prints `No new emails since the last scan.` and exits (still running `--clean-inbox` if requested, using the accumulated surfaced set).
+The seen-set accumulates across runs (capped at 5000 records, oldest dropped first), so emails stay skipped even if they're still unread. If nothing new has arrived, the scan prints `No new emails since the last scan.` and exits (normal cleanup has nothing to act on; use the explicit `--from-cache` mode for cached cleanup).
 
 To re-analyze everything the queries return — ignoring the cache — pass `--rescan`:
 
@@ -182,7 +182,7 @@ python scanner.py --rescan
 
 ## Inbox cleanup (`--clean-inbox`)
 
-`--clean-inbox` finds unread emails from job aggregators (LinkedIn, Glassdoor, Jobright, Wellfound, ZipRecruiter, Indeed) that the scanner did **not** surface as internship-relevant and marks them as read, clearing inbox noise.
+`--clean-inbox` acts only on successfully evaluated emails from the current scan. Messages omitted by fetch caps, keyword searches, fetch failures, or analysis failures are untouched. It finds unread emails from job aggregators (LinkedIn, Glassdoor, Jobright, Wellfound, ZipRecruiter, Indeed) that the scanner did **not** surface as internship-relevant and marks them as read, clearing inbox noise.
 
 - Without `--apply`: dry run — lists what would be marked, touches nothing
 - With `--apply`: actually marks them as read
@@ -295,3 +295,22 @@ Smaller models (7b/8b) occasionally return malformed JSON or rename expected key
 - All analysis runs locally through Ollama — no data is sent to OpenAI, Anthropic, or any other AI provider
 - `credentials.json` and `token.json` stay on your machine and are already in `.gitignore`
 - `.last_scan.json` (the `--from-cache` snapshot) stores only message IDs, subjects, senders, and dates — no email bodies — and is also gitignored
+
+## Offline regression checks
+
+From `cli/`, using the project virtualenv:
+
+```bash
+venv/bin/python -m unittest discover -v
+venv/bin/python test_linkedin.py
+venv/bin/python test_wellfound.py
+venv/bin/python test_interninsider.py
+venv/bin/python test_target_term.py
+```
+
+Failed classification passes are reported separately and remain eligible for retry.
+Both LLM passes must complete before a decision replaces an earlier result.
+Successful rescans replace old keep decisions; failures preserve them. `compare.py
+--apply` requires successful evaluation and negative agreement from both pipelines.
+The explicit `--from-cache` mode retains its broader, potentially stale cleanup
+behavior, but excludes known failed analyses and never records cleanup as analysis.

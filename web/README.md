@@ -95,3 +95,19 @@ Open DevTools → **Network** during a scan. You should see requests **only** to
 (`huggingface.co` / `raw.githubusercontent.com`). **No** request carries email content
 to any backend — that's the guarantee. With the Ollama backend, the only extra traffic
 is to `localhost:11434` on the user's own machine.
+
+## Offline validation
+
+```bash
+npm test
+npx tsc --noEmit
+npm run build
+```
+
+Tests use fixtures and mocked OAuth, Gmail, inference and IndexedDB boundaries;
+no mailbox is accessed. Mailbox caches are scoped to the authenticated Gmail
+profile address and loaded only after sign-in. Legacy unscoped caches are ignored.
+Sign-out clears displayed data and invalidates ongoing scans. Failed classification
+passes remain retryable and preserve prior results; successful rescans replace
+prior decisions. Low-memory mode uses rules for classification, so optional model
+summary extraction failures retain the successfully classified rule result.
