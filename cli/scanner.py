@@ -10,8 +10,10 @@ import json
 import os
 import re
 import sys
+import unicodedata
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -304,6 +306,23 @@ def run_gmail_search(service, keyword: str = "", days: int = 30, unread_only: bo
     return list(all_emails.values())
 
 
+def aggregator_query(days: int = 30, unread_only: bool = True) -> str:
+    """Gmail query matching only CLEAN_INBOX_SENDERS — the exact candidate set
+    clean_inbox considers. Never matches personal mail."""
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
+    sender_clauses = " OR ".join(f"from:{s}" for s in CLEAN_INBOX_SENDERS)
+    query = f"({sender_clauses}) after:{cutoff}"
+    return f"is:unread {query}" if unread_only else query
+
+
+def fetch_aggregator_emails(service, days: int = 30, unread_only: bool = True, max_results: int = 500) -> list[dict]:
+    """Fetch every aggregator email cleanup could touch, regardless of whether
+    it contains an internship keyword, so each one gets evaluated."""
+    query = aggregator_query(days, unread_only)
+    print(f"  Searching: {query[:100]}…")
+    return search_emails(service, query, max_results=max_results)
+
+
 # ── Ollama Analysis ─────────────────────────────────────────────────────────
 
 def check_ollama():
@@ -365,9 +384,8 @@ CLASSIFICATION PRIORITY:
   as relevant technical fields when they are explicitly internships/student roles.
 - For job-alert digest emails (LinkedIn, Glassdoor, Jobright, Wellfound), scan the ENTIRE body for
   any internship/co-op/stage/student listing, including research/R&D internships, that
-  is in the Montreal area for in-person/hybrid work OR explicitly fully remote anywhere
-  — not just the headline. Surface the email if ANY listing in it qualifies, even if it
-  appears in a recommendations section.
+  is located in Canada — not just the headline. Surface the email if ANY listing
+  in it qualifies, even if it appears in a recommendations section.
 
 For each email, determine if it is one of:
 - Internship / co-op / stage / stagiaire job postings (STUDENT positions only)
@@ -391,11 +409,10 @@ STRICT RULES — these MUST be followed:
    directly (e.g. PCL, WSP, Staples, Indeed Apply confirmations) about YOUR internship
    applications ARE relevant and should be included.
 4. IGNORE newsletters, promotional emails, Quora digests, and unrelated content.
-5. LOCATION — only include job LISTINGS located in the Montreal area (Montreal,
-   Greater Montreal, Laval, Longueuil, Brossard) for in-person/hybrid work, OR
-   listings that are explicitly fully REMOTE from anywhere. EXCLUDE hybrid/on-site
-   listings clearly located elsewhere (Toronto, Ottawa, Vancouver, Calgary, USA,
-   etc.). EXCEPTION: application
+5. LOCATION — only include job LISTINGS located in Canada (any province or city,
+   e.g. Montreal, Toronto, Ottawa, Vancouver, Calgary, Waterloo), including remote
+   listings open to Canada. EXCLUDE listings located outside Canada (USA, Europe,
+   etc.) and remote listings restricted to another country. EXCEPTION: application
    confirmations, recruiter outreach, interview invitations, and status updates about
    the user's OWN applications are always relevant — never drop those for location.
 6. EXCLUDE QA/testing-focused roles, even if they are internships or co-ops:
@@ -449,12 +466,12 @@ INCLUDE only if at least one applies:
 - Body clearly describes a student / intern / co-op position
 - Recruiter or career-address message about an internship application
 For digest emails (LinkedIn, Glassdoor, Jobright, Wellfound), scan the FULL body — include if ANY \
-listing is an internship that is in the Montreal area for in-person/hybrid work OR \
-explicitly fully remote from anywhere, even if buried in recommendations.
+listing is an internship that is located in Canada, even if buried in recommendations.
 
-LOCATION: include a listing only if it is in the Montreal area (Montreal, Laval, Longueuil, \
-Brossard) for in-person/hybrid work, or explicitly fully remote from anywhere; exclude \
-hybrid/on-site listings clearly in other cities (Toronto, Ottawa, Vancouver, USA). \
+LOCATION: include a listing only if it is located in Canada (any province or city, e.g. \
+Montreal, Toronto, Ottawa, Vancouver, Calgary), including remote listings open to Canada; \
+exclude listings outside Canada (USA, Europe, etc.) and remote listings restricted to another \
+country. \
 Application confirmations, recruiter outreach, and interview invites about the user's own \
 applications are kept regardless of location.
 
@@ -708,24 +725,49 @@ _NON_SOFTWARE_RESEARCH_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Location filter — the user only wants internships they can actually take:
-# in-person/hybrid listings must be in the Montreal area, while fully remote
-# listings can be anywhere. Application confirmations, recruiter outreach, and
-# interview invites are kept regardless of location (enforced via the LLM prompt,
-# and by leaving non-aggregator emails un-location-filtered in the rule path).
-_MONTREAL_AREA_REGEXES = (
+# Location filter — the user wants internships anywhere in Canada, including
+# remote roles based in Canada. Those need no pattern of their own: "Canada
+# (Remote)" and "Remote in Canada" match on "Canada". A bare "remote" still does
+# not count — it also matched job blurbs ("onsite and remote IT support") and
+# US-only rows ("Remote only, Austin"). Application confirmations, recruiter
+# outreach, and interview invites are kept regardless of location (enforced via
+# the LLM prompt, and by leaving non-aggregator emails un-location-filtered in
+# the rule path).
+#
+# Cities that are also surnames, first names, or common elsewhere (London,
+# Victoria, Hamilton, Surrey, Regina, Markham, Halifax) are left out; they still
+# match when written with their province code ("London, ON"). Names shared with
+# US places are rejected when a state code follows: "New Brunswick, NJ",
+# "Ontario, CA", "Waterloo, IA". The state list is case-sensitive so "Toronto,
+# in person" still matches.
+_NOT_US_STATE = (
+    r"(?!,\s*(?-i:A[KLRZ]|C[AOT]|D[CE]|FL|GA|HI|I[ADLN]|K[SY]|LA|M[ADEINOST]"
+    r"|N[CDEHJMVY]|O[HKR]|PA|RI|S[CD]|T[NX]|UT|V[AT]|W[AIVY])\b)"
+)
+_CANADA_LOCATION_REGEXES = (
     re.compile(r"\bmontr[eé]al\b", re.IGNORECASE),
     re.compile(r"\bmtl\b", re.IGNORECASE),
     re.compile(r"\bgreater montreal\b", re.IGNORECASE),
     re.compile(r"\bgrand montr[eé]al\b", re.IGNORECASE),
     re.compile(r"\b(?:laval|longueuil|brossard)\b", re.IGNORECASE),
-)
-
-_REMOTE_REGEXES = (
-    re.compile(r"\bremote\b", re.IGNORECASE),
-    re.compile(r"\bt[eé]l[eé][\s\-]?travail\b", re.IGNORECASE),
-    re.compile(r"\bwork[\s\-]?from[\s\-]?home\b", re.IGNORECASE),
-    re.compile(r"\bwfh\b", re.IGNORECASE),
+    # "KPMG Canada · Seattle" names the company, not the place — a location is
+    # never immediately followed by the "·" that introduces one (the same rule
+    # _LINKEDIN_CARD_END_RE relies on). \b keeps "Canadian Tire" out.
+    re.compile(r"\bcanada\b(?!\s*·)", re.IGNORECASE),
+    # Case-sensitive, and only after a comma: "Toronto, ON" but not "focus on".
+    re.compile(r",\s*(?:QC|ON|BC|AB|MB|SK|NS|NB|NL|PE|YT|NT|NU)\b"),
+    re.compile(
+        r"\b(?:qu[eé]bec|ontario|british columbia|alberta|manitoba|saskatchewan"
+        r"|nova scotia|new brunswick|newfoundland|prince edward island)\b"
+        + _NOT_US_STATE,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:toronto|ottawa|gatineau|vancouver|burnaby|calgary|edmonton"
+        r"|waterloo|kitchener|mississauga|brampton|winnipeg|saskatoon"
+        r"|sherbrooke)\b" + _NOT_US_STATE,
+        re.IGNORECASE,
+    ),
 )
 
 # "stage" alone matches English "Late Stage", "Early Stage", etc.
@@ -983,8 +1025,8 @@ def _split_linkedin_cards(text: str) -> list[str]:
     "·" that introduces one.
 
     Unlike a str.split the matched text stays with the card it belongs to,
-    which matters for the location field: cutting "Canada (Remote)" out of a
-    chunk would take the only evidence that the listing is remote with it."""
+    which matters for the location field: cutting "Montreal, QC (Hybrid)" out
+    of a chunk would take the only evidence of where the listing is with it."""
     cuts = {0, len(text)}
     for rx in (_LINKEDIN_CARD_END_RE, _LINKEDIN_CARD_SEP_RE):
         for m in rx.finditer(text):
@@ -1189,6 +1231,137 @@ def _all_intern_listings_excluded(sender: str, body: str, subject: str = "") -> 
     return all(_is_off_target_term(c, inherited) for c in chunks)
 
 
+# ── Duplicate-listing keys ──────────────────────────────────────────────────
+#
+# Glassdoor repeats a listing across unrelated digests ("Your recently viewed
+# jobs", recommendations), so one qualifying listing can keep a dozen emails
+# unread. Cleanup keeps only the newest unread copy of each listing, which needs
+# a key per listing. Keys err toward "different": two listings merged into one
+# key marks a real internship read, while one listing split into two keys only
+# leaves noise. Any listing whose key can't be derived reliably makes the whole
+# email undedupable.
+
+# Glassdoor puts each company's rating chip BEFORE its ★, so a listing's company
+# is the tail of the previous chunk: "... Easy Apply 6d Tower Research Capital 4.1".
+_GLASSDOOR_RATING_TAIL_RE = re.compile(r"\s+\d\.\d\s*$")
+# Chrome that can directly precede that company name: section headers, the
+# previous listing's badges, its posting age ("6d", "24h", "30d+") and the close
+# of its salary estimate.
+_GLASSDOOR_COMPANY_LEAD_RE = re.compile(
+    r"Your recently viewed jobs|Jobs you might like|Just posted|Easy Apply"
+    r"|\(\s*Employer Est\.\s*\)|\b\d+[dh]\+?(?!\w)",
+    re.IGNORECASE,
+)
+# A company name longer than this means the lead token was not where we think.
+_LISTING_COMPANY_MAX_WORDS = 8
+
+
+def _normalize_key_part(text: str) -> str:
+    """Casefold, strip accents, drop punctuation and collapse whitespace."""
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).casefold()
+    return " ".join(re.sub(r"[^\w\s]|_", " ", text).split())
+
+
+def _location_start(chunk: str) -> int | None:
+    starts = [m.start() for rx in _CANADA_LOCATION_REGEXES for m in [rx.search(chunk)] if m]
+    return min(starts) if starts else None
+
+
+def _glassdoor_company(prev_chunk: str) -> str:
+    """The company named by a Glassdoor rating chip at the end of prev_chunk,
+    or "" when it can't be isolated reliably."""
+    m = _GLASSDOOR_RATING_TAIL_RE.search(prev_chunk)
+    if not m:
+        return ""
+    head = prev_chunk[:m.start()]
+    leads = list(_GLASSDOOR_COMPANY_LEAD_RE.finditer(head))
+    if not leads:
+        return ""
+    company = head[leads[-1].end():].strip()
+    if len(company.split()) > _LISTING_COMPANY_MAX_WORDS:
+        return ""
+    return company
+
+
+def qualifying_listing_keys(sender: str, body: str, subject: str = "") -> list[str] | None:
+    """Keys ("<sender domain>|<company>|<title>") for the listings that qualify
+    this email, i.e. the ones _all_intern_listings_excluded judges it by.
+
+    Returns None for non-aggregator mail, or when any qualifying listing lacks
+    a reliable key; [] when nothing qualifies. Either way the email must never
+    be deduped. The title is the text before the listing's location, and it
+    must itself carry the internship keyword and the explicit target term, so
+    a location inside the title ("Intern - Montreal - Summer 2027 - Backend")
+    can't truncate two different postings to the same key."""
+    s = (sender or "").lower()
+    family = next((d for d in AGGREGATOR_SENDERS if d in s), None)
+    if family is None:
+        return None
+    inherited = _inherited_target_term(sender, body)
+    chunks = _split_aggregator_listings(sender, body, subject)
+    keys: list[str] = []
+    for i, chunk in enumerate(chunks):
+        if not _is_qualifying_listing(chunk) or _is_off_target_term(chunk, inherited):
+            continue
+        company = ""
+        if family == "glassdoor.com":
+            if i == 0:
+                return None
+            title = chunk[:_location_start(chunk)]
+            company = _glassdoor_company(chunks[i - 1])
+            if not company:
+                return None
+        elif family == "linkedin.com":
+            if "·" not in chunk:
+                return None
+            title = chunk.split("·", 1)[0]
+        else:
+            title = chunk[:_location_start(chunk)]
+        if not (_body_mentions_internship(title) and TARGET_TERM_REGEX.search(title)):
+            return None
+        title, company = _normalize_key_part(title), _normalize_key_part(company)
+        if not title or (family == "glassdoor.com" and not company):
+            return None
+        keys.append(f"{family}|{company}|{title}")
+    return list(dict.fromkeys(keys))
+
+
+def dedupe_kept_ids(kept_ids, listing_keys: dict, dates: dict) -> dict[str, str]:
+    """Kept emails whose qualifying listings all appear in a newer kept email.
+
+    Returns {duplicate id: id of a newer email that keeps one of its listings}.
+    Only ids with a non-empty key list and a parsable date take part; the rest
+    are never dropped and never own a key. Each key is owned by its newest id
+    (ties broken by id), and an id is dropped iff every one of its keys is owned
+    by a different id."""
+    entries: dict[str, tuple[datetime, list[str]]] = {}
+    for eid in kept_ids:
+        keys = (listing_keys or {}).get(eid)
+        if not keys:
+            continue
+        try:
+            dt = parsedate_to_datetime(dates.get(eid) or "")
+        except (TypeError, ValueError):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        entries[eid] = (dt, keys)
+
+    owner: dict[str, str] = {}
+    for eid in sorted(entries):
+        for key in entries[eid][1]:
+            cur = owner.get(key)
+            if cur is None or (entries[eid][0], eid) > (entries[cur][0], cur):
+                owner[key] = eid
+
+    dupes: dict[str, str] = {}
+    for eid, (_, keys) in entries.items():
+        if all(owner[k] != eid for k in keys):
+            dupes[eid] = max((owner[k] for k in keys), key=lambda o: (entries[o][0], o))
+    return dupes
+
+
 RECRUITER_SENDER_HINTS = (
     "talent@", "careers@", "career@", "hr@", "recruiter@", "recruiting@",
     "hiring@", "jobs@", "noreply@", "no-reply@",
@@ -1294,13 +1467,8 @@ def _mentions_excluded_role(text: str) -> bool:
 
 
 def _mentions_location(text: str) -> bool:
-    """True if a listing is Montreal-area or explicitly remote from anywhere."""
-    if not text:
-        return False
-    return (
-        any(rx.search(text) for rx in _MONTREAL_AREA_REGEXES)
-        or any(rx.search(text) for rx in _REMOTE_REGEXES)
-    )
+    """True if a listing is located in Canada (remote-in-Canada included)."""
+    return bool(text) and any(rx.search(text) for rx in _CANADA_LOCATION_REGEXES)
 
 
 def _is_qualifying_listing(chunk: str) -> bool:
@@ -1691,7 +1859,11 @@ def save_scan_cache(emails: list[dict], results: list[dict], merge: bool = True,
     merge=True (default) accumulates this run's emails/kept_ids into the existing
     cache so the seen set grows across runs. The email list is capped at
     SEEN_CACHE_MAX, dropping the oldest records first; kept_ids are pruned to ids
-    still present in that capped set so they stay bounded too."""
+    still present in that capped set so they stay bounded too.
+
+    listing_keys maps each kept id to its qualifying_listing_keys (null when it
+    can't be deduped), computed here while bodies are still in hand; cleanup
+    uses them to keep only the newest unread copy of a repeated listing."""
     successful_ids = getattr(results, "successful_ids", {e["id"] for e in emails})
     failed_ids = set(failed_ids) | getattr(results, "failed_ids", set())
     emails = [e for e in emails if e["id"] in successful_ids]
@@ -1701,10 +1873,19 @@ def save_scan_cache(emails: list[dict], results: list[dict], merge: bool = True,
         for e in emails if e.get("id")
     ]
     kept_ids = [r.get("id") for r in results if r.get("id") in successful_ids]
+    by_email_id = {e["id"]: e for e in emails}
+    listing_keys = {
+        eid: qualifying_listing_keys(by_email_id[eid].get("from", ""),
+                                     by_email_id[eid].get("body", ""),
+                                     by_email_id[eid].get("subject", ""))
+        for eid in kept_ids if eid in by_email_id
+    }
 
     existing = (load_scan_cache() or {}) if merge else {}
     prev_emails = existing.get("emails", []) or []
     prev_kept = [eid for eid in existing.get("kept_ids", []) if eid not in successful_ids]
+    prev_keys = {eid: keys for eid, keys in (existing.get("listing_keys") or {}).items()
+                 if eid not in successful_ids}
     retry_ids = (set(existing.get("failed_ids", [])) | failed_ids) - successful_ids
 
     # Merge emails by id, preserving order (oldest first) so the cap drops the
@@ -1724,11 +1905,14 @@ def save_scan_cache(emails: list[dict], results: list[dict], merge: bool = True,
 
     live_ids = {e["id"] for e in merged_emails}
     merged_kept = [eid for eid in dict.fromkeys(prev_kept + kept_ids) if eid in live_ids]
+    merged_keys = {eid: keys for eid, keys in {**prev_keys, **listing_keys}.items()
+                   if eid in live_ids}
 
     payload = {
         "scan_time": datetime.now().isoformat(timespec="seconds"),
         "emails": merged_emails,
         "kept_ids": merged_kept,
+        "listing_keys": merged_keys,
         "failed_ids": sorted(retry_ids),
     }
     CACHE_PATH.write_text(json.dumps(payload))
@@ -1761,7 +1945,8 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
                 apply: bool = False, email_cache: dict | None = None,
                 keep_ids: set[str] | None = None,
                 evaluated_ids: set[str] | None = None, from_cache: bool = False,
-                failed_ids: set[str] | None = None):
+                failed_ids: set[str] | None = None,
+                listing_keys: dict | None = None):
     """Mark unread emails from job-aggregator senders as read IF they're not in
     the scanner's results. Aggregator emails the scanner surfaced stay unread.
 
@@ -1774,12 +1959,14 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
     and subject safety checks. This trades freshness for speed; failed_ids are
     still excluded. Broad cleanup does not count as a completed analysis.
     keep_ids: match the keep set by message ID rather than sender/date.
+    listing_keys: message-id -> qualifying_listing_keys, from the scan cache.
+    A kept email whose listings all appear in a newer kept email is marked read
+    instead (subject safety net and the gates above still apply). Ids without
+    keys are never treated as duplicates.
 
     Returns emails actually marked read (empty for dry runs).
     """
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
-    sender_clauses = " OR ".join(f"from:{s}" for s in CLEAN_INBOX_SENDERS)
-    query = f"is:unread ({sender_clauses}) after:{cutoff}"
+    query = aggregator_query(days)
 
     print(f"\n{BOLD}Inbox cleanup{RESET}")
     print(f"  Querying unread aggregator emails: {query[:80]}…")
@@ -1809,9 +1996,9 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
             if sender and date:
                 keep_keys.add((sender, date))
 
-    to_mark: list[dict] = []
-    kept_count = 0
-    kept_subject_safety = 0
+    # Collect header info for every candidate first: duplicate detection needs
+    # the dates of all kept candidates before any single one can be decided.
+    infos: list[dict] = []
     cache_hits = 0
     for meta in candidates:
         msg_id = meta["id"]
@@ -1845,7 +2032,22 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
             in_keep = msg_id in keep_ids
         else:
             in_keep = (sender_raw.strip().lower(), date_raw.strip()) in keep_keys
-        if in_keep:
+        infos.append({"id": msg_id, "from": sender_raw, "subject": subject,
+                      "date": date_raw, "in_keep": in_keep})
+
+    # A kept email whose qualifying listings all appear in a newer kept email
+    # is a duplicate. Owners are drawn only from kept candidates, so the copy
+    # that stays unread is always one this run leaves alone.
+    kept_infos = {i["id"]: i for i in infos if i["in_keep"]}
+    duplicates = dedupe_kept_ids(
+        kept_infos, listing_keys or {}, {eid: i["date"] for eid, i in kept_infos.items()})
+
+    to_mark: list[dict] = []
+    kept_count = 0
+    kept_subject_safety = 0
+    for info in infos:
+        msg_id, subject = info["id"], info["subject"]
+        if info["in_keep"] and msg_id not in duplicates:
             kept_count += 1
             continue
         # Safety net: keep unread if subject mentions BOTH an internship keyword
@@ -1860,11 +2062,16 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
         ):
             kept_subject_safety += 1
             continue
-        to_mark.append({"id": meta["id"], "from": sender_raw, "subject": subject, "date": date_raw})
+        entry = {"id": msg_id, "from": info["from"], "subject": subject, "date": info["date"]}
+        if msg_id in duplicates:
+            entry["newer_copy"] = kept_infos[duplicates[msg_id]]["subject"]
+        to_mark.append(entry)
 
+    n_dupes = sum(1 for m in to_mark if "newer_copy" in m)
     cache_note = f", {cache_hits} from cache" if cache_hits else ""
     print(f"  Found {len(candidates)} unread aggregator email(s){cache_note}; keeping {kept_count} (scanner-surfaced) "
-          f"+ {kept_subject_safety} (subject mentions internship); {len(to_mark)} to mark as read.\n")
+          f"+ {kept_subject_safety} (subject mentions internship); {n_dupes} duplicate(s) of a newer email; "
+          f"{len(to_mark)} to mark as read.\n")
 
     if not to_mark:
         print("  Nothing to mark.\n")
@@ -1872,6 +2079,8 @@ def clean_inbox(service, results: list[dict] | None = None, days: int = 30,
 
     for m in to_mark:
         print(f"  • {m['subject'][:70]}")
+        if "newer_copy" in m:
+            print(f"      {DIM}(duplicate listing, newer copy kept: {m['newer_copy'][:60]}){RESET}")
         print(f"      {DIM}from {m['from']}  ·  {m['date']}{RESET}")
 
     if not apply:
@@ -2007,6 +2216,7 @@ def main():
         clean_inbox(
             service, days=args.days, apply=args.apply, email_cache=email_cache,
             keep_ids=keep_ids, from_cache=True, failed_ids=set(cached.get("failed_ids", [])),
+            listing_keys=cached.get("listing_keys", {}),
         )
         return
 
@@ -2078,6 +2288,7 @@ def main():
             service, days=args.days, apply=args.apply,
             email_cache=email_cache, keep_ids=set(cache.get("kept_ids", [])),
             evaluated_ids=getattr(results, "successful_ids", {e["id"] for e in emails}),
+            listing_keys=cache.get("listing_keys", {}),
         )
 
 

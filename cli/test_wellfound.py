@@ -72,10 +72,10 @@ BAD_BODY = (
 # Wellfound stamps "| Internship" on every card regardless of the actual role —
 # this is the real 2026-04-14 digest, where a Senior (Level 3) analyst wanting
 # 12 years of experience is labelled an internship. Keyword filtering cannot
-# tell that apart from a real intern listing, so a remote software row like this
-# DOES pass _has_internship_signal. The season gate is what drops it, and this
-# body pins that division of labour: if the label ever starts qualifying emails
-# on its own, the second assertion below fails.
+# tell that apart from a real intern listing. Remote rows no longer pass the
+# location gate, and the season gate would drop them anyway; this body pins
+# that: if the label ever starts qualifying emails on its own, the second
+# assertion below fails.
 LABEL_NOISE_BODY = (
     "< Hi Sunny! I've found 2 new jobs that might interest you! "
     "Ready to Interview Open to offers Closed to Offers "
@@ -157,8 +157,8 @@ def main() -> int:
                                      WELLFOUND_SENDER),
           "all-full-time digest was surfaced (cross-listing keyword union)")
 
-    # Wellfound's blanket "| Internship" label means a senior remote software
-    # row still passes the keyword gate; the season gate is what must drop it.
+    # Wellfound's blanket "| Internship" label must not surface a senior remote
+    # software row: the location and season gates both drop it.
     label_subject = ("New jobs: Salesforce Field Service Administrator at "
                      "Crane NXT and 1 more jobs")
     check(failures,

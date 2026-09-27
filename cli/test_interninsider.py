@@ -56,7 +56,8 @@ def digest(*cards: str, truncated: int = 0, alert: str = "Summer 2027",
     return body + " " + FOOTER.format(alert=alert)
 
 
-# Real listings from the live corpus. None are Montreal, none are remote.
+# Real listings from the live corpus: Canadian, outside Montreal. They pass
+# the location gate now that it covers all of Canada.
 CALGARY_SWE = ("Software Engineering Intern Hexagon Manufacturing Intelligence "
                "Calgary, Alberta, Canada Implement tools and automation to "
                "enhance developer productivity")
@@ -70,6 +71,18 @@ TORONTO_STRATEGY = ("Student, Junior Strategy Analyst (AI Strategy) Sun Life "
                     "leadership")
 # An explicit-term Montreal software fixture also survives independently of
 # the saved-filter name; qualifying termless cards can now inherit the term.
+# Out-of-country cards, shaped like the Canadian ones above: these must still
+# fail the location gate. SEATTLE_IT says "remote" in its blurb (adapted from a
+# real Calgary BURNCO card), which once counted as a remote location.
+SEATTLE_SWE = ("Software Engineering Intern Hexagon Manufacturing Intelligence "
+               "Seattle, Washington, United States Implement tools and automation "
+               "to enhance developer productivity")
+AUSTIN_SWE = ("Software Engineering Intern Rivian Austin, Texas, United States "
+              "Design, develop, and test software features within an existing "
+              "infotainment, mobile, or connectivity application")
+SEATTLE_IT = ("IT Support Analyst Student Acme Rock Products Seattle, Washington, "
+              "United States Provide responsive onsite and remote IT support to "
+              "end-users (hardware, software, mobile, peripherals, VOIP)")
 MONTREAL_SWE = ("Software Developer Intern (Summer 2027) Nimbus Labs "
                 "Montreal, Quebec, Canada Build backend services in Python")
 
@@ -126,23 +139,30 @@ def main() -> int:
     check(failures, all("just now" not in c for c in chunks),
           f"posting age leaked into a chunk: {chunks}")
 
-    # 4. Inheritance cannot rescue Calgary/Vancouver cards. Without inheritance,
+    # 4. Inheritance cannot rescue out-of-country cards. Without inheritance,
     #    the individual termless cards still fail the explicit-term check.
-    body = digest(CALGARY_SWE, VANCOUVER_SWE)
+    body = digest(SEATTLE_SWE, AUSTIN_SWE)
     check(failures, _all_intern_listings_excluded(SENDER, body),
           "off-target digest rescued by the alert name in its own chrome")
     check(failures, all(_is_off_target_term(c) for c in chunks),
           f"a card claimed the target term it never states: {chunks}")
 
-    # 5. Out-of-province internships are dropped on location, which the
-    #    non-aggregator path never checked at all.
-    for label, card in (("Calgary", CALGARY_SWE), ("Vancouver", VANCOUVER_SWE)):
+    # 5. Out-of-country internships are dropped on location, which the
+    #    non-aggregator path never checked at all. Canadian ones outside
+    #    Montreal surface and inherit the "Summer 2027" alert term.
+    for label, card in (("Seattle", SEATTLE_SWE), ("Austin", AUSTIN_SWE)):
         b = digest(card)
         check(failures, not _has_internship_signal("1 new match", b, SENDER),
               f"{label} internship surfaced despite the location filter")
+    for label, card in (("Calgary", CALGARY_SWE), ("Vancouver", VANCOUVER_SWE)):
+        b = digest(card)
+        check(failures, _has_internship_signal("1 new match", b, SENDER)
+              and not _all_intern_listings_excluded(SENDER, b),
+              f"{label} internship was dropped despite being in Canada")
 
-    # 6. Toronto business-strategy roles are dropped as well — the LLM arm kept
-    #    one of these, in violation of both its location and full-time rules.
+    # 6. Toronto business-strategy roles are dropped — not on location any
+    #    more, but because nothing in the card is software. The LLM arm once
+    #    kept one of these.
     b = digest(TORONTO_STRATEGY)
     check(failures, not _has_internship_signal("1 new match", b, SENDER),
           "Toronto strategy-analyst role surfaced")
@@ -175,7 +195,7 @@ def main() -> int:
           "non-target name rescued termless Lyft")
     check(failures, not _all_intern_listings_excluded(SENDER, digest(MONTREAL_SWE, alert="Montreal SWE")),
           "non-target name blocked explicit target")
-    for card in (HIVER, CALGARY_SWE, VANCOUVER_SWE,
+    for card in (HIVER, SEATTLE_SWE, AUSTIN_SWE,
                  "Software Developer Nimbus Labs Montreal, Quebec, Canada Build backend services",
                  "Software QA Intern Nimbus Labs Montreal, Quebec, Canada Build backend services"):
         check(failures, _all_intern_listings_excluded(SENDER, digest(card)),
@@ -241,6 +261,13 @@ def main() -> int:
                            ("Summer Intern", False), ("Summer 2027", False)):
         check(failures, _is_off_target_term(text, inherited=True) == excluded,
               f"inherited decision incorrect for {text!r}")
+
+    # Only Canadian locations qualify; "remote" in a US listing's blurb does not.
+    check(failures, not _is_qualifying_listing(SEATTLE_IT),
+          "US listing qualified on the word 'remote' in its blurb")
+    check(failures, not _has_internship_signal('1 new match for "Summer 2027"',
+                                               digest(SEATTLE_IT), SENDER),
+          "US IT support digest was surfaced")
 
     if failures:
         print(f"FAILED {len(failures)} check(s):")

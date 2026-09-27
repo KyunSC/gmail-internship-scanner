@@ -17,9 +17,9 @@ from scanner import (
     analyze_with_ollama,
     clean_inbox,
     clear_scan_cache,
+    fetch_aggregator_emails,
     get_gmail_service,
     load_scan_cache,
-    run_gmail_search,
     save_scan_cache,
 )
 
@@ -55,7 +55,7 @@ def print_email_list(emails: list[dict], label: str, color: str = ""):
 def main():
     parser = argparse.ArgumentParser(description="Compare LLM scanner vs rule-based parser")
     parser.add_argument("-d", "--days", type=int, default=30)
-    parser.add_argument("-n", "--max-emails", type=int, default=100)
+    parser.add_argument("-n", "--max-emails", type=int, default=500)
     parser.add_argument("--all", action="store_true", help="Include read emails")
     parser.add_argument(
         "--apply",
@@ -83,8 +83,12 @@ def main():
     print(f"\n{BOLD}Scanner Comparison: LLM vs rule-based{RESET}\n")
 
     service = get_gmail_service(write_access=args.apply)
-    print(f"Fetching emails (last {args.days} days, {'all' if args.all else 'unread only'})…")
-    emails = run_gmail_search(
+    # Fetch exactly the aggregator senders cleanup may touch — never personal
+    # mail. A keyword search would miss digests without an intern term (e.g.
+    # "X is hiring"), and cleanup only marks emails that were evaluated, so
+    # those would stay unread forever.
+    print(f"Fetching aggregator emails (last {args.days} days, {'all' if args.all else 'unread only'})…")
+    emails = fetch_aggregator_emails(
         service, days=args.days, unread_only=not args.all, max_results=args.max_emails
     )
     print(f"  Fetched {len(emails)} emails total\n")
@@ -104,7 +108,17 @@ def main():
         emails = fresh
 
     if not emails:
+        # Nothing new to analyze, but cached decisions are still successful
+        # evaluations — clean against them so a dry run followed by --apply
+        # actually marks what the dry run listed.
         print("  No new emails since the last scan.\n")
+        clean_inbox(
+            service, days=args.days, apply=args.apply,
+            email_cache={e["id"]: e for e in cached.get("emails", []) if e.get("id")},
+            keep_ids=set(cached.get("kept_ids", [])),
+            evaluated_ids=seen_ids, failed_ids=set(cached.get("failed_ids", [])),
+            listing_keys=cached.get("listing_keys", {}),
+        )
         return
 
     # ── Rule-based (full body, no LLM) ──────────────────────────────────────
@@ -167,13 +181,17 @@ def main():
     evaluated = [e for e in emails if e["id"] in llm_results.successful_ids]
     cache = save_scan_cache(evaluated, [*llm_results, *rule_kept], failed_ids=llm_results.failed_ids)
 
-    # Both pipelines must successfully agree before current-scan cleanup.
+    # Both pipelines must successfully agree before cleanup. Emails skipped as
+    # cached were successfully evaluated on an earlier run; their keep decision
+    # lives in the cache's kept_ids, so they're cleanable too.
     keep_ids = rule_ids | llm_ids | set(cache.get("kept_ids", []))
     email_cache = {e["id"]: e for e in cache.get("emails", []) if e.get("id")}
     clean_inbox(
         service, days=args.days, apply=args.apply,
         email_cache=email_cache, keep_ids=keep_ids,
-        evaluated_ids=llm_results.successful_ids,
+        evaluated_ids=llm_results.successful_ids | seen_ids,
+        failed_ids=set(cache.get("failed_ids", [])),
+        listing_keys=cache.get("listing_keys", {}),
     )
 
 

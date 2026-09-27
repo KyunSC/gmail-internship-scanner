@@ -20,11 +20,13 @@ Gmail (Google servers) --API--> Your machine --Ollama--> Results (local only)
 gmail-internship-scanner/
 ├── cli/                   # Local command-line scanner (Python) — this README
 │   ├── scanner.py         # Main scanner — Gmail fetch + Ollama LLM analysis
+│   ├── github_watcher.py  # New Summer 2027 postings from GitHub listing repos (SimplifyJobs, vanshb03)
 │   ├── compare.py         # Dev tool: runs both LLM and rule-based filter, diffs results
 │   ├── dump_sender.py     # Dev tool: prints extracted bodies for a sender, to learn a new digest format
 │   ├── credentials.json   # Google OAuth client secret (not committed)
 │   ├── token.json         # Cached OAuth token (not committed)
 │   ├── .last_scan.json    # Accumulated scan snapshot — seen emails for incremental scans + --from-cache (not committed)
+│   ├── .github_seen.json  # github_watcher.py's seen postings + saved ETags (not committed)
 │   └── requirements.txt
 └── web/                   # Browser dashboard (fully client-side; runs Gmail + LLM in the browser)
 ```
@@ -189,6 +191,8 @@ python scanner.py --rescan
 - Emails the scanner surfaced **always stay unread**
 - Emails whose subject directly mentions an internship keyword are kept as a safety net even if the scanner missed them
 
+Aggregators repeat listings across digests (Glassdoor re-sends a listing in "recently viewed" and recommendation sections), so one internship could otherwise keep a dozen emails unread. Cleanup keeps only the **newest unread copy** of each qualifying listing: a surfaced email whose qualifying listings all appear in a newer surfaced email is marked read, and an email with any listing no newer email has stays unread. Listings are matched per sender (never across senders) by company and title. An email whose listings can't be identified reliably, or that was surfaced only by the LLM, is never deduped.
+
 This requires the Gmail **modify** scope. On first use with `--clean-inbox`, a new browser authorization prompt will appear.
 
 ### Fast cleanup (`--from-cache`)
@@ -223,6 +227,7 @@ Runs several targeted Gmail queries (internship/co-op/stage keywords, applicatio
 Before hitting the LLM, emails with no internship signal are dropped:
 - Subject, body, or sender must contain an internship keyword (`intern`, `internship`, `co-op`, `coop`, `student`, `stagiaire`, or `stage` in French context only — see note below)
 - Only qualifying listings that explicitly say Summer 2027 are kept; undated and other-term listings are excluded
+- Digest listings must be located in Canada — any province or major city, or remote roles based in Canada ("Canada (Remote)", "Remote in Canada"). A bare "remote" doesn't count, and US-only listings are dropped. Your own application confirmations, recruiter outreach, and interview invites are kept regardless of location
 
 **Note on `stage`:** The word "stage" in English matches startup funding rounds ("Late Stage", "Early Stage"). The scanner only treats `stage` as an internship signal in the body when French words appear directly before or after it (e.g. `"un stage"`, `"bénévole stage"`, `"stage développeur"`). Subject-line matching is unaffected.
 
@@ -243,6 +248,24 @@ LLM results are validated:
 
 ### 5. Display
 Results are sorted by priority and color-coded by category: `INTERNSHIP` (green), `RECRUITER` (magenta), `APP CONFIRM` (blue), `REPLY` (yellow), `STATUS` (white).
+
+---
+
+## GitHub listings watcher (`github_watcher.py`)
+
+Community repos like [SimplifyJobs/Summer2027-Internships](https://github.com/SimplifyJobs/Summer2027-Internships) list new internships within hours of opening — often before any email digest arrives. `github_watcher.py` reads their structured `listings.json`, applies the same rules as the scanner (Summer 2027, software, no QA roles, located in Canada), and prints only postings you haven't seen on a previous run, newest first, with the apply link. No Gmail, no Ollama.
+
+```bash
+venv/bin/python github_watcher.py              # new postings since last run (marks them seen)
+venv/bin/python github_watcher.py --no-mark    # preview without marking anything seen
+venv/bin/python github_watcher.py --show-all   # every current match, seen or not
+venv/bin/python github_watcher.py --anywhere   # skip the Canada location filter
+venv/bin/python github_watcher.py --days 60    # widen the posting-age window (default 30)
+venv/bin/python github_watcher.py -o gh.json   # also export shown postings as JSON
+venv/bin/python github_watcher.py --reset      # forget seen postings
+```
+
+The first run shows every current match. After that, a repo that hasn't changed answers with HTTP 304 via its saved ETag, so a quiet re-run downloads nothing. A duplicate role listed in both repos is shown once. Sources live in `SOURCES` at the top of the file; add another repo there if it publishes the same `listings.json` format.
 
 ---
 
@@ -295,6 +318,7 @@ Smaller models (7b/8b) occasionally return malformed JSON or rename expected key
 - All analysis runs locally through Ollama — no data is sent to OpenAI, Anthropic, or any other AI provider
 - `credentials.json` and `token.json` stay on your machine and are already in `.gitignore`
 - `.last_scan.json` (the `--from-cache` snapshot) stores only message IDs, subjects, senders, and dates — no email bodies — and is also gitignored
+- `github_watcher.py` only makes anonymous GET requests to `raw.githubusercontent.com`; nothing about you or your inbox is sent. Its `.github_seen.json` is gitignored
 
 ## Offline regression checks
 
@@ -306,6 +330,7 @@ venv/bin/python test_linkedin.py
 venv/bin/python test_wellfound.py
 venv/bin/python test_interninsider.py
 venv/bin/python test_target_term.py
+venv/bin/python test_location.py
 ```
 
 Failed classification passes are reported separately and remain eligible for retry.

@@ -6,4 +6,5 @@ results.json
 .env
 .last_scan.json
 .last_results.json
+.github_seen.json
 venv/

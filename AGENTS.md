@@ -7,7 +7,7 @@ Guidance for coding agents working in this repo. Humans: see [README.md](README.
 - `cli/` — the Python command-line scanner (Gmail fetch + local Ollama analysis). **All Python commands run from here.**
 - `web/` — a separate, fully client-side browser dashboard. Shares nothing with the CLI at runtime.
 
-## Running the CLI (`scanner.py`, `compare.py`, `dump_sender.py`)
+## Running the CLI (`scanner.py`, `compare.py`, `dump_sender.py`, `github_watcher.py`)
 
 These scripts live in `cli/`, not the project root, and they import each other as
 sibling modules (`compare.py` does `from scanner import ...`). Two things must be
@@ -37,6 +37,7 @@ The same rule applies to the other scripts:
 cd cli
 venv/bin/python scanner.py
 venv/bin/python dump_sender.py wellfound --days 180 --all
+venv/bin/python scanner.py --rescan   # re-check already-seen emails (e.g. after a filter change)
 ```
 
 Equivalent, if you'd rather activate the env first:
@@ -46,6 +47,22 @@ cd cli
 source venv/bin/activate
 python compare.py
 ```
+
+### GitHub listings watcher (`github_watcher.py`)
+
+Shows new Summer 2027 software internships in Canada from the GitHub listing
+repos (SimplifyJobs, vanshb03), with apply links. Needs network only — no Gmail
+or Ollama.
+
+```bash
+cd cli
+venv/bin/python github_watcher.py            # the user's command: new postings since last run
+venv/bin/python github_watcher.py --no-mark  # preview without marking anything seen
+```
+
+Use `--no-mark` when trying `github_watcher.py` yourself: a plain run records
+every shown posting in `cli/.github_seen.json`, so the user would never see
+those postings as new.
 
 ### Runtime prerequisites (only if a command actually reaches those stages)
 
