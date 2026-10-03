@@ -1,5 +1,6 @@
-"""Checks for github_watcher: schema normalization, the listing filter, and
-the seen-set / ETag state across runs. No network — requests.get is faked.
+"""Checks for github_watcher: schema normalization, README-table parsing, the
+listing filter, cross-repo dedup, and the seen-set / ETag state across runs.
+No network — requests.get is faked and SOURCES is replaced with test sources.
 
     venv/bin/python -m unittest test_github_watcher -v
 """
@@ -7,6 +8,7 @@ the seen-set / ETag state across runs. No network — requests.get is faked.
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -16,22 +18,35 @@ import github_watcher as gw
 
 NOW = time.time()
 HOUR = 3600
-SIMPLIFY, VANSH = gw.SOURCES
+SIMPLIFY = {"name": "simplify", "url": "https://raw.example/simplify.json",
+            "format": "json", "default_year": "2027"}
+VANSH = {"name": "vansh", "url": "https://raw.example/vansh.json",
+         "format": "json", "default_year": "2027"}
+NEGAR = {"name": "negar", "url": "https://raw.example/README.md", "format": "markdown"}
+TEST_SOURCES = [SIMPLIFY, VANSH, NEGAR]
 
 
 def simplify_row(title, company, locations, *, terms=("Summer 2027",),
-                 category="Software", active=True, age=HOUR):
+                 category="Software", active=True, age=HOUR, url=None):
     return {"id": f"s-{company}-{title}", "company_name": company, "title": title,
             "locations": list(locations), "terms": list(terms), "category": category,
             "active": active, "is_visible": True, "date_posted": int(NOW - age),
-            "url": f"https://jobs.example/{company}"}
+            "url": url or f"https://jobs.example/{company}/{title.replace(' ', '-')}"}
 
 
-def vansh_row(title, company, locations, *, season="Summer", age=HOUR):
+def vansh_row(title, company, locations, *, season="Summer", age=HOUR, url=None):
     return {"id": f"v-{company}-{title}", "company_name": company, "title": title,
             "locations": list(locations), "season": season, "active": True,
             "is_visible": True, "date_posted": int(NOW - age),
-            "url": f"https://jobs.example/{company}"}
+            "url": url or f"https://jobs.example/{company}/{title.replace(' ', '-')}"}
+
+
+def readme_date(age=HOUR):
+    return datetime.fromtimestamp(NOW - age, timezone.utc).strftime("%b %-d, %Y")
+
+
+def badge(url):
+    return f"[![Apply](https://img.shields.io/badge/-Apply-blue?style=for-the-badge)]({url})"
 
 
 SIMPLIFY_ROWS = [
@@ -48,18 +63,36 @@ SIMPLIFY_ROWS = [
     simplify_row("Reporting Analyst Intern", "Insureco", ["Toronto, ON, Canada"],
                  category="AI/ML/Data"),
     simplify_row("Software Engineer Intern", "Stale", ["Toronto, ON, Canada"], age=60 * 86400),
+    simplify_row("Software Developer Intern", "Nadate", ["Toronto, ON, Canada"],
+                 terms=("N/A",)),                                                     # --include-termless only
 ]
 VANSH_ROWS = [
     vansh_row("Software Engineer Intern", "Gamma", ["Montreal, Canada"]),             # keep
-    vansh_row("Software Engineer Intern", "Acme", ["Toronto, ON"]),                   # dup of Acme
+    vansh_row("Software Engineering Intern", "Acme Inc", ["Toronto, ON"]),            # dup of Acme by name
     vansh_row("Software Engineer Intern", "Fallco", ["Toronto, ON"], season="Fall"),
+    # Same posting as Simplify's Beta, company spelled differently: dup by URL.
+    vansh_row("Backend Developer Intern", "Beta Technologies Inc",
+              ["Remote in Canada"], url=SIMPLIFY_ROWS[1]["url"] + "?utm_source=vansh"),
 ]
-EXPECTED = {"Acme", "Beta", "Delta", "Gamma"}
+NEGAR_README = f"""# Canadian Tech Internships
+
+| Company | Role | Location | Apply | Date Posted |
+|--------|------|----------|:-----:|--------------|
+| Intelcom \\| Dragonfly | Software Developer Intern (Summer 2027) | Montreal, QC / Remote, Canada | {badge("https://jobs.example/intelcom/1")} | {readme_date()} |
+| ↳ | Data Engineer Intern (Winter 2027) | Montreal, QC | {badge("https://jobs.example/intelcom/2")} | {readme_date()} |
+| ↳ | Back-end Developer Intern | Montreal, QC | {badge("https://jobs.example/intelcom/3")} | {readme_date()} |
+| Nokia | Software Tools Development Co-op Intern (Summer 2027) | Ottawa, ON | Closed🔒 | {readme_date()} |
+
+Contributing text after the table.
+"""
+EXPECTED = {"Acme", "Beta", "Delta", "Gamma", "Intelcom | Dragonfly"}
+TERMLESS = {"Nadate", "Intelcom | Dragonfly"}  # Intelcom's third row names no term
 
 
 def response(status, data=None, etag=None):
     resp = MagicMock(status_code=status, headers={"ETag": etag} if etag else {})
     resp.json.return_value = data
+    resp.text = data if isinstance(data, str) else ""
     resp.raise_for_status.side_effect = (
         requests.HTTPError(f"{status}") if status >= 400 else None)
     return resp
@@ -69,8 +102,9 @@ class FakeGitHub:
     """Serves each source's rows with a fixed ETag, and 304 when it's echoed."""
 
     def __init__(self, rows=None, etags=None, fail=()):
-        self.rows = rows or {SIMPLIFY["url"]: SIMPLIFY_ROWS, VANSH["url"]: VANSH_ROWS}
-        self.etags = etags or {SIMPLIFY["url"]: '"e-simplify"', VANSH["url"]: '"e-vansh"'}
+        self.rows = rows or {SIMPLIFY["url"]: SIMPLIFY_ROWS, VANSH["url"]: VANSH_ROWS,
+                             NEGAR["url"]: NEGAR_README}
+        self.etags = etags or {s["url"]: f'"e-{s["name"]}"' for s in TEST_SOURCES}
         self.fail = set(fail)
         self.sent = []
 
@@ -84,6 +118,12 @@ class FakeGitHub:
         return response(200, self.rows[url], self.etags[url])
 
 
+def all_listings():
+    rows = ([(r, SIMPLIFY) for r in SIMPLIFY_ROWS] + [(r, VANSH) for r in VANSH_ROWS]
+            + [(r, NEGAR) for r in gw.parse_markdown_listings(NEGAR_README)])
+    return [gw.normalize_listing(r, s) for r, s in rows]
+
+
 class NormalizeAndFilterTests(unittest.TestCase):
     def test_simplify_schema(self):
         l = gw.normalize_listing(SIMPLIFY_ROWS[0], SIMPLIFY)
@@ -95,10 +135,11 @@ class NormalizeAndFilterTests(unittest.TestCase):
         self.assertEqual(l["terms"], ["Summer 2027"])
         self.assertIsNone(l["category"])
 
-    def wanted(self, anywhere=False):
-        rows = [(r, SIMPLIFY) for r in SIMPLIFY_ROWS] + [(r, VANSH) for r in VANSH_ROWS]
-        return {l["company"] for l in (gw.normalize_listing(r, s) for r, s in rows)
-                if gw.is_wanted(l, 30, anywhere, NOW)}
+    def wanted(self, **kwargs):
+        # The filter alone doesn't dedupe, so vansh's copies of Acme and Beta
+        # (spelled differently) pass too; watch() folds them into the originals.
+        return ({l["company"] for l in all_listings() if gw.is_wanted(l, 30, now=NOW, **kwargs)}
+                - {"Acme Inc", "Beta Technologies Inc"})
 
     def test_filter_keeps_canadian_software_summer_2027(self):
         self.assertEqual(self.wanted(), EXPECTED)
@@ -106,15 +147,54 @@ class NormalizeAndFilterTests(unittest.TestCase):
     def test_anywhere_drops_only_the_location_rule(self):
         self.assertEqual(self.wanted(anywhere=True), EXPECTED | {"Usco"})
 
+    def test_include_termless_adds_only_unstated_terms(self):
+        self.assertEqual(self.wanted(include_termless=True), EXPECTED | TERMLESS)
+        titles = {l["title"] for l in all_listings()
+                  if gw.is_wanted(l, 30, now=NOW, include_termless=True)}
+        self.assertIn("Back-end Developer Intern", titles)
+        self.assertNotIn("Data Engineer Intern (Winter 2027)", titles)
+
+
+class MarkdownParseTests(unittest.TestCase):
+    def setUp(self):
+        self.rows = gw.parse_markdown_listings(NEGAR_README)
+
+    def test_rows_and_repeated_company(self):
+        self.assertEqual(len(self.rows), 4)
+        self.assertEqual({r["company_name"] for r in self.rows[:3]}, {"Intelcom | Dragonfly"})
+        self.assertEqual(self.rows[3]["company_name"], "Nokia")
+
+    def test_apply_link_skips_badge_image(self):
+        self.assertEqual(self.rows[0]["url"], "https://jobs.example/intelcom/1")
+
+    def test_closed_row_is_inactive(self):
+        self.assertTrue(self.rows[0]["active"])
+        self.assertFalse(self.rows[3]["active"])
+
+    def test_locations_split_and_date_parsed(self):
+        self.assertEqual(self.rows[0]["locations"], ["Montreal, QC", "Remote, Canada"])
+        self.assertLess(abs(self.rows[0]["date_posted"] - (NOW - HOUR)), 86400)
+
+    def test_terms_come_from_title_when_stated(self):
+        self.assertTrue(self.rows[0]["terms"])
+        self.assertEqual(self.rows[2]["terms"], [])
+
+    def test_no_table_is_an_error(self):
+        fake = FakeGitHub(rows={NEGAR["url"]: "# Nothing here"})
+        with patch.object(gw.requests, "get", side_effect=fake):
+            with self.assertRaises(ValueError):
+                gw.fetch_source(NEGAR, None)
+
 
 class WatchStateTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.state_path = Path(tmp.name) / "seen.json"
-        patcher = patch.object(gw, "STATE_PATH", self.state_path)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for name, value in (("STATE_PATH", self.state_path), ("SOURCES", TEST_SOURCES)):
+            patcher = patch.object(gw, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def run_watch(self, fake, **kwargs):
         with patch.object(gw.requests, "get", side_effect=fake):
@@ -125,21 +205,33 @@ class WatchStateTests(unittest.TestCase):
         shown, statuses = self.run_watch(fake)
         self.assertEqual({l["company"] for l in shown}, EXPECTED)
         self.assertEqual(len(shown), len(EXPECTED), "cross-repo duplicate shown twice")
-        self.assertEqual(statuses, {"simplify": "updated", "vansh": "updated"})
+        self.assertEqual(set(statuses.values()), {"updated"})
 
         fake.sent.clear()
         shown, statuses = self.run_watch(fake)
         self.assertEqual(shown, [])
-        self.assertEqual(statuses, {"simplify": "unchanged", "vansh": "unchanged"})
-        self.assertEqual({s for _, s in fake.sent}, {'"e-simplify"', '"e-vansh"'})
+        self.assertEqual(set(statuses.values()), {"unchanged"})
+        self.assertEqual({s for _, s in fake.sent}, {f'"e-{s["name"]}"' for s in TEST_SOURCES})
 
     def test_only_new_postings_after_repo_update(self):
         self.run_watch(FakeGitHub())
         new_row = simplify_row("Software Developer Intern", "Newco", ["Vancouver, BC, Canada"])
-        fake = FakeGitHub(rows={SIMPLIFY["url"]: SIMPLIFY_ROWS + [new_row], VANSH["url"]: VANSH_ROWS},
-                          etags={SIMPLIFY["url"]: '"e-simplify-2"', VANSH["url"]: '"e-vansh"'})
-        shown, _ = self.run_watch(fake)
+        rows = {SIMPLIFY["url"]: SIMPLIFY_ROWS + [new_row], VANSH["url"]: VANSH_ROWS,
+                NEGAR["url"]: NEGAR_README}
+        etags = {s["url"]: f'"e-{s["name"]}"' for s in TEST_SOURCES}
+        etags[SIMPLIFY["url"]] = '"e-simplify-2"'
+        shown, _ = self.run_watch(FakeGitHub(rows=rows, etags=etags))
         self.assertEqual([l["company"] for l in shown], ["Newco"])
+
+    def test_same_posting_in_another_repo_is_not_new_later(self):
+        # Seen once via Simplify; a later repo listing the same URL under a
+        # different company name must not resurface it.
+        rows = {SIMPLIFY["url"]: SIMPLIFY_ROWS, VANSH["url"]: [], NEGAR["url"]: NEGAR_README}
+        self.run_watch(FakeGitHub(rows=rows))
+        etags = {s["url"]: f'"e-{s["name"]}"' for s in TEST_SOURCES}
+        etags[VANSH["url"]] = '"e-vansh-2"'
+        shown, _ = self.run_watch(FakeGitHub(etags=etags))
+        self.assertEqual([l["company"] for l in shown], ["Gamma"])
 
     def test_show_all_ignores_seen_and_etag(self):
         self.run_watch(FakeGitHub())
@@ -170,10 +262,12 @@ class WatchStateTests(unittest.TestCase):
 
     def test_changed_filters_refetch_instead_of_trusting_304(self):
         self.run_watch(FakeGitHub())
-        fake = FakeGitHub()
-        shown, _ = self.run_watch(fake, anywhere=True)
-        self.assertEqual({s for _, s in fake.sent}, {None})
-        self.assertEqual([l["company"] for l in shown], ["Usco"])
+        for kwargs, extra in (({"anywhere": True}, {"Usco"}),
+                              ({"include_termless": True}, TERMLESS)):
+            fake = FakeGitHub()
+            shown, _ = self.run_watch(fake, **kwargs)
+            self.assertEqual({s for _, s in fake.sent}, {None}, kwargs)
+            self.assertEqual({l["company"] for l in shown} - EXPECTED, extra - EXPECTED, kwargs)
 
 
 if __name__ == "__main__":

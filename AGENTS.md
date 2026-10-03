@@ -51,13 +51,14 @@ python compare.py
 ### GitHub listings watcher (`github_watcher.py`)
 
 Shows new Summer 2027 software internships in Canada from the GitHub listing
-repos (SimplifyJobs, vanshb03), with apply links. Needs network only — no Gmail
-or Ollama.
+repos (SimplifyJobs, vanshb03, michelleokolie, negarprh), with apply links.
+Needs network only — no Gmail or Ollama.
 
 ```bash
 cd cli
 venv/bin/python github_watcher.py            # the user's command: new postings since last run
 venv/bin/python github_watcher.py --no-mark  # preview without marking anything seen
+venv/bin/python github_watcher.py --include-termless  # also postings that name no term
 ```
 
 Use `--no-mark` when trying `github_watcher.py` yourself: a plain run records

@@ -5,17 +5,16 @@ import the real symbols, print failures, exit non-zero.
 
     venv/bin/python test_interninsider.py
 
-Saved-filter names are stripped from cards but may supply the target term to
-independently qualifying Intern Insider listings. Another stated term vetoes
-inheritance; explicit target terms win. Posting ages must separate cards so
-neighbours cannot lend each other software or location keywords.
+Saved-filter names are stripped from cards and supply no term: a card must
+state the target term itself, since the "Summer 2027" filter returns Winter
+2027 roles. Posting ages must separate cards so neighbours cannot lend each
+other software or location keywords.
 """
 
 import sys
 
 from scanner import (
     _all_intern_listings_excluded,
-    _inherited_target_term,
     _OTHER_TERM_REGEX,
     _clean_interninsider_body,
     _has_internship_signal,
@@ -69,8 +68,8 @@ TORONTO_STRATEGY = ("Student, Junior Strategy Analyst (AI Strategy) Sun Life "
                     "Toronto, Ontario, Canada Develop executive-ready "
                     "presentations and strategic recommendations for senior "
                     "leadership")
-# An explicit-term Montreal software fixture also survives independently of
-# the saved-filter name; qualifying termless cards can now inherit the term.
+# An explicit-term Montreal software fixture survives on its own term; the
+# termless qualifying cards above are excluded by the season gate.
 # Out-of-country cards, shaped like the Canadian ones above: these must still
 # fail the location gate. SEATTLE_IT says "remote" in its blurb (adapted from a
 # real Calgary BURNCO card), which once counted as a remote location.
@@ -94,6 +93,10 @@ PWC_PRIVACY = ("Cyber and Privacy - Summer Intern PwC Montreal, Quebec, Canada "
                "Learn cybersecurity concepts like detection and response")
 TECHNOLOGY_STRATEGY = ("Technology Strategy - Summer Intern PwC Montreal, Quebec, Canada "
                        "Work with practitioners to help clients address complex business challenges")
+# Shaped like the real alert that stayed unread: a termless co-op card under
+# the "Summer 2027" filter, for what was a Winter 2027 role.
+BREE_COOP = ("Software Engineer, Backend (Co-op) Bree Toronto, Ontario, Canada "
+             "Build and improve backend services, APIs, and integrations")
 HIVER = ("Stagiaire en développement logiciel - Hiver 2027 Nimbus Labs Montreal, "
          "Quebec, Canada Build backend services in Python")
 
@@ -139,8 +142,8 @@ def main() -> int:
     check(failures, all("just now" not in c for c in chunks),
           f"posting age leaked into a chunk: {chunks}")
 
-    # 4. Inheritance cannot rescue out-of-country cards. Without inheritance,
-    #    the individual termless cards still fail the explicit-term check.
+    # 4. The alert name in the digest's own chrome cannot rescue termless
+    #    cards: each one fails the explicit-term check.
     body = digest(SEATTLE_SWE, AUSTIN_SWE)
     check(failures, _all_intern_listings_excluded(SENDER, body),
           "off-target digest rescued by the alert name in its own chrome")
@@ -149,16 +152,18 @@ def main() -> int:
 
     # 5. Out-of-country internships are dropped on location, which the
     #    non-aggregator path never checked at all. Canadian ones outside
-    #    Montreal surface and inherit the "Summer 2027" alert term.
+    #    Montreal surface, but the season gate excludes them: their cards state
+    #    no term, and the "Summer 2027" alert name does not supply one.
     for label, card in (("Seattle", SEATTLE_SWE), ("Austin", AUSTIN_SWE)):
         b = digest(card)
         check(failures, not _has_internship_signal("1 new match", b, SENDER),
               f"{label} internship surfaced despite the location filter")
     for label, card in (("Calgary", CALGARY_SWE), ("Vancouver", VANCOUVER_SWE)):
         b = digest(card)
-        check(failures, _has_internship_signal("1 new match", b, SENDER)
-              and not _all_intern_listings_excluded(SENDER, b),
+        check(failures, _has_internship_signal("1 new match", b, SENDER),
               f"{label} internship was dropped despite being in Canada")
+        check(failures, _all_intern_listings_excluded(SENDER, b),
+              f"termless {label} card inherited the alert name's term")
 
     # 6. Toronto business-strategy roles are dropped — not on location any
     #    more, but because nothing in the card is software. The LLM arm once
@@ -167,8 +172,8 @@ def main() -> int:
     check(failures, not _has_internship_signal("1 new match", b, SENDER),
           "Toronto strategy-analyst role surfaced")
 
-    # 7. Explicit listing terms still work alongside the inheritance exception:
-    #    Montreal, software, and Summer 2027 stated by the card itself.
+    # 7. Explicit listing terms still work: Montreal, software, and Summer
+    #    2027 stated by the card itself.
     good = digest(MONTREAL_SWE, CALGARY_SWE, TORONTO_STRATEGY)
     check(failures, _has_internship_signal("3 new matches", good, SENDER),
           "digest containing a Montreal Summer 2027 internship was dropped")
@@ -185,12 +190,13 @@ def main() -> int:
           _split_aggregator_listings(SENDER, NEWSLETTER_BODY) == [NEWSLETTER_BODY],
           "marketing newsletter was split as if it were a card digest")
 
-    # Scoped inheritance and mandatory per-listing gates.
-    for card in (LYFT, PWC_SERVICE, PWC_PRIVACY):
+    # Termless qualifying cards are surfaced but excluded, whatever the alert
+    # is named; per-listing gates stay mandatory.
+    for card in (LYFT, PWC_SERVICE, PWC_PRIVACY, BREE_COOP):
         check(failures, _has_internship_signal("1 new match", digest(card), SENDER),
               f"qualifying card has no internship signal: {card}")
-        check(failures, not _all_intern_listings_excluded(SENDER, digest(card)),
-              f"qualifying card failed inheritance: {card}")
+        check(failures, _all_intern_listings_excluded(SENDER, digest(card)),
+              f"termless card inherited the alert name's term: {card}")
     check(failures, _all_intern_listings_excluded(SENDER, digest(LYFT, alert="Montreal SWE")),
           "non-target name rescued termless Lyft")
     check(failures, not _all_intern_listings_excluded(SENDER, digest(MONTREAL_SWE, alert="Montreal SWE")),
@@ -199,16 +205,10 @@ def main() -> int:
                  "Software Developer Nimbus Labs Montreal, Quebec, Canada Build backend services",
                  "Software QA Intern Nimbus Labs Montreal, Quebec, Canada Build backend services"):
         check(failures, _all_intern_listings_excluded(SENDER, digest(card)),
-              f"inheritance bypassed a listing gate: {card}")
-    check(failures, _inherited_target_term(SENDER.upper(), digest(LYFT).replace('"Summer 2027"', '“Summer 2027”')),
-          "curly quotes or case-insensitive sender failed")
-    for sender, body in ((SENDER, NEWSLETTER_BODY), ("alerts@example.com", digest(LYFT)),
-                         (SENDER, digest(LYFT, alert="Montreal SWE"))):
-        check(failures, not _inherited_target_term(sender, body), "unscoped inheritance")
-    check(failures, _is_off_target_term(LYFT), "termless card kept without inheritance")
-    for inherited in (False, True):
-        check(failures, not _is_off_target_term("Winter 2027 and Summer 2027 Software Intern", inherited),
-              "explicit target lost precedence")
+              f"card bypassed a listing gate: {card}")
+    check(failures, _is_off_target_term(LYFT), "termless card kept")
+    check(failures, not _is_off_target_term("Winter 2027 and Summer 2027 Software Intern"),
+          "explicit target lost precedence")
 
     chunks = _split_aggregator_listings(SENDER, digest(TECHNOLOGY_STRATEGY, PWC_PRIVACY,
                                                      ages=["1h ago", "just now"]))
@@ -257,10 +257,10 @@ def main() -> int:
     for text in negatives:
         check(failures, not _OTHER_TERM_REGEX.search(text), f"other-term regex falsely matched {text!r}")
     for text, excluded in ((HIVER, True), ("Summer 2026", True), ("SU26", True),
-                           ("W27", True), (LYFT, False), ("Intern Cyber Security 2027", False),
-                           ("Summer Intern", False), ("Summer 2027", False)):
-        check(failures, _is_off_target_term(text, inherited=True) == excluded,
-              f"inherited decision incorrect for {text!r}")
+                           ("W27", True), (LYFT, True), ("Intern Cyber Security 2027", True),
+                           ("Summer Intern", True), ("Summer 2027", False)):
+        check(failures, _is_off_target_term(text) == excluded,
+              f"season decision incorrect for {text!r}")
 
     # Only Canadian locations qualify; "remote" in a US listing's blurb does not.
     check(failures, not _is_qualifying_listing(SEATTLE_IT),

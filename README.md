@@ -20,7 +20,7 @@ Gmail (Google servers) --API--> Your machine --Ollama--> Results (local only)
 gmail-internship-scanner/
 ├── cli/                   # Local command-line scanner (Python) — this README
 │   ├── scanner.py         # Main scanner — Gmail fetch + Ollama LLM analysis
-│   ├── github_watcher.py  # New Summer 2027 postings from GitHub listing repos (SimplifyJobs, vanshb03)
+│   ├── github_watcher.py  # New Summer 2027 postings from GitHub listing repos (SimplifyJobs, vanshb03, michelleokolie, negarprh)
 │   ├── compare.py         # Dev tool: runs both LLM and rule-based filter, diffs results
 │   ├── dump_sender.py     # Dev tool: prints extracted bodies for a sender, to learn a new digest format
 │   ├── credentials.json   # Google OAuth client secret (not committed)
@@ -253,19 +253,31 @@ Results are sorted by priority and color-coded by category: `INTERNSHIP` (green)
 
 ## GitHub listings watcher (`github_watcher.py`)
 
-Community repos like [SimplifyJobs/Summer2027-Internships](https://github.com/SimplifyJobs/Summer2027-Internships) list new internships within hours of opening — often before any email digest arrives. `github_watcher.py` reads their structured `listings.json`, applies the same rules as the scanner (Summer 2027, software, no QA roles, located in Canada), and prints only postings you haven't seen on a previous run, newest first, with the apply link. No Gmail, no Ollama.
+Community repos list new internships within hours of opening — often before any email digest arrives. `github_watcher.py` reads four of them:
+
+| Source | Repo | Format |
+|---|---|---|
+| `simplify` | [SimplifyJobs/Summer2027-Internships](https://github.com/SimplifyJobs/Summer2027-Internships) | `listings.json` |
+| `vansh` | [vanshb03/Summer2027-Internships](https://github.com/vanshb03/Summer2027-Internships) | `listings.json` |
+| `michelle` | [michelleokolie/canada-tech-internships-summer-2027](https://github.com/michelleokolie/canada-tech-internships-summer-2027) | `listings.json` (Canada only) |
+| `negar` | [negarprh/Canadian-Tech-Internships-2027](https://github.com/negarprh/Canadian-Tech-Internships-2027) | README table (Canada only) |
+
+It applies the same rules as the scanner (Summer 2027, software, no QA roles, located in Canada), and prints only postings you haven't seen on a previous run, newest first, with the apply link. No Gmail, no Ollama.
 
 ```bash
 venv/bin/python github_watcher.py              # new postings since last run (marks them seen)
 venv/bin/python github_watcher.py --no-mark    # preview without marking anything seen
 venv/bin/python github_watcher.py --show-all   # every current match, seen or not
 venv/bin/python github_watcher.py --anywhere   # skip the Canada location filter
+venv/bin/python github_watcher.py --include-termless  # also postings that name no term, labelled [term not stated]
 venv/bin/python github_watcher.py --days 60    # widen the posting-age window (default 30)
 venv/bin/python github_watcher.py -o gh.json   # also export shown postings as JSON
 venv/bin/python github_watcher.py --reset      # forget seen postings
 ```
 
-The first run shows every current match. After that, a repo that hasn't changed answers with HTTP 304 via its saved ETag, so a quiet re-run downloads nothing. A duplicate role listed in both repos is shown once. Sources live in `SOURCES` at the top of the file; add another repo there if it publishes the same `listings.json` format.
+The first run shows every current match. After that, a repo that hasn't changed answers with HTTP 304 via its saved ETag, so a quiet re-run downloads nothing. A role listed in several repos is shown once — matched by apply link, or by company + title allowing small spelling differences ("TRC" vs "TRC Companies"). Sources live in `SOURCES` at the top of the file; add another repo there if it publishes `listings.json` or a README table with Company / Role / Location / Apply / Date Posted columns.
+
+Most negarprh postings don't say which term they're for, so by default they only show when the title says Summer 2027. `--include-termless` shows them too, but many turn out to be Fall or Winter roles — check the posting before applying.
 
 ---
 

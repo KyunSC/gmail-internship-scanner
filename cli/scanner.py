@@ -853,8 +853,9 @@ TARGET_TERM_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Bound each year before excluding the target so a four-digit target cannot
-# backtrack into a two-digit or partial-year match.
+# A term other than the target, which github_watcher.py uses to tell termed
+# postings from termless ones. Bound each year before excluding the target so a
+# four-digit target cannot backtrack into a two-digit or partial-year match.
 _OTHER_YEAR = rf"(?!{TARGET_YEAR}\b)\d{{4}}\b"
 _OTHER_SHORT_YEAR = rf"(?!{_YY}\b)\d{{2}}\b"
 _OTHER_TERM_REGEX = re.compile(
@@ -1074,27 +1075,15 @@ def _clean_linkedin_body(subject: str, body: str) -> str:
 # the newest roles matching your "<alert>" filter. <card> just now <card> just
 # now ... Applying early is ...".
 #
-# The saved-filter name remains stripped from listing text. It supplies only
-# a digest-level term signal: each listing must independently pass internship,
-# software, location, and excluded-role checks. Another stated term vetoes
-# inheritance, while an explicit target term in the listing continues to win.
+# The saved-filter name is stripped from listing text and supplies no term.
+# Cards never state one themselves, and the "Summer 2027" filter has returned
+# Winter 2027 roles (Oct 2026), so trusting the name kept winter-only alerts
+# unread. Like every other sender, a card needs an explicit target term of its
+# own.
 _INTERNINSIDER_HEAD_RE = re.compile(
     r"Here are the newest roles matching your\s+.{0,80}?\s*filter\.",
     re.IGNORECASE,
 )
-
-_INTERNINSIDER_ALERT_NAME_RE = re.compile(
-    r'Here are the newest roles matching your\s+["“]([^"“”]{1,80})["”]\s*filter\.',
-    re.IGNORECASE,
-)
-
-
-def _inherited_target_term(sender: str, body: str) -> bool:
-    """Use only an Intern Insider saved-filter name from the uncleaned body."""
-    if "interninsider.me" not in (sender or "").lower():
-        return False
-    match = _INTERNINSIDER_ALERT_NAME_RE.search(body)
-    return bool(match and TARGET_TERM_REGEX.search(match.group(1)))
 
 
 # "+ N more, open in Intern Insider to view" trails a truncated digest, and the
@@ -1176,18 +1165,14 @@ def _split_aggregator_listings(sender: str, body: str, subject: str = "") -> lis
     return [body]
 
 
-def _is_off_target_term(chunk: str, inherited: bool = False) -> bool:
-    """True unless a listing explicitly targets Summer 2027 or inherits it.
+def _is_off_target_term(chunk: str) -> bool:
+    """True unless a listing explicitly targets Summer 2027.
 
-    Explicit target terms always win, even alongside another term. Otherwise,
-    only Intern Insider alerts with a target-named saved filter may supply the
-    term, and another stated term vetoes that inheritance. All listing gates
-    still apply separately. Other senders continue to require an explicit term.
-    A bare year ("Intern Cyber Security 2027") is not an explicit target term.
+    An explicit target term wins even alongside another term. A bare year
+    ("Intern Cyber Security 2027") is not an explicit target term, and no
+    sender's digest-level text (an Intern Insider filter name) can supply one.
     """
-    if TARGET_TERM_REGEX.search(chunk):
-        return False
-    return not inherited or bool(_OTHER_TERM_REGEX.search(chunk))
+    return not TARGET_TERM_REGEX.search(chunk)
 
 
 def _season_checked_chunks(sender: str, body: str, subject: str = "") -> list[str]:
@@ -1219,16 +1204,12 @@ def _season_checked_chunks(sender: str, body: str, subject: str = "") -> list[st
 
 
 def _all_intern_listings_excluded(sender: str, body: str, subject: str = "") -> bool:
-    """True if no qualifying listing has an explicit or inherited target term.
-
-    Intern Insider saved-filter inheritance is vetoed by another stated term;
-    an explicit target term always wins. Empty qualifying sets stay excluded.
-    """
-    inherited = _inherited_target_term(sender, body)
+    """True if no qualifying listing states an explicit target term.
+    Empty qualifying sets stay excluded."""
     chunks = _season_checked_chunks(sender, body, subject)
     if not chunks:
         return True
-    return all(_is_off_target_term(c, inherited) for c in chunks)
+    return all(_is_off_target_term(c) for c in chunks)
 
 
 # ── Duplicate-listing keys ──────────────────────────────────────────────────
@@ -1298,11 +1279,10 @@ def qualifying_listing_keys(sender: str, body: str, subject: str = "") -> list[s
     family = next((d for d in AGGREGATOR_SENDERS if d in s), None)
     if family is None:
         return None
-    inherited = _inherited_target_term(sender, body)
     chunks = _split_aggregator_listings(sender, body, subject)
     keys: list[str] = []
     for i, chunk in enumerate(chunks):
-        if not _is_qualifying_listing(chunk) or _is_off_target_term(chunk, inherited):
+        if not _is_qualifying_listing(chunk) or _is_off_target_term(chunk):
             continue
         company = ""
         if family == "glassdoor.com":
