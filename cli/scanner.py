@@ -325,15 +325,19 @@ def fetch_aggregator_emails(service, days: int = 30, unread_only: bool = True, m
 
 # ── Ollama Analysis ─────────────────────────────────────────────────────────
 
+def canonical_model_name(name: str) -> str:
+    """Keep repository and quantization exact; an omitted tag means latest."""
+    return name if ":" in name.rsplit("/", 1)[-1] else f"{name}:latest"
+
+
 def check_ollama():
     """Verify Ollama is running and the model is available."""
     try:
         r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
         r.raise_for_status()
         models = [m["name"] for m in r.json().get("models", [])]
-        # Check if model (with or without tag) is available
-        model_base = OLLAMA_MODEL.split(":")[0]
-        available = any(model_base in m for m in models)
+        available = any(canonical_model_name(OLLAMA_MODEL) == canonical_model_name(m)
+                        for m in models)
         if not available:
             print(f"\n[!] Model '{OLLAMA_MODEL}' not found. Available models:")
             for m in models:

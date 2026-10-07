@@ -351,3 +351,49 @@ Successful rescans replace old keep decisions; failures preserve them. `compare.
 --apply` requires successful evaluation and negative agreement from both pipelines.
 The explicit `--from-cache` mode retains its broader, potentially stale cleanup
 behavior, but excludes known failed analyses and never records cleanup as analysis.
+
+### Opt-in model trial: Qwen3.8 27B IQ4_XS
+
+From `cli/`, with Ollama running:
+
+```bash
+ollama pull qwen3.5:9b
+ollama pull hf.co/unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS
+venv/bin/python compare_models.py
+# Optional overrides (output must stay inside .model_trials/):
+venv/bin/python compare_models.py --baseline qwen3.5:9b \
+  --candidate hf.co/unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS \
+  --days 30 --max-emails 20 --output .model_trials/trial.json
+```
+
+The exact model tag is required; a different quantization will not satisfy the
+availability check. The runner checks both models on a synthetic email before
+accessing Gmail, then fetches up to 20 unread aggregator emails **once**. It uses
+read-only Gmail operations (an existing broader OAuth token may be reused), never
+marks messages read, and never reads or writes normal scanner caches. Do not run
+other Ollama workloads alongside it.
+
+Both models receive identical content sequentially, with keyword prefiltering
+disabled. Existing prompts, two-pass temperatures, context sizing, 180-second
+request timeout, body limit, and post-analysis safety filters are preserved.
+Models are unloaded between runs. No memory limits or content limits are changed
+to make the candidate fit.
+
+Ignored `cli/.model_trials/` JSON artifacts include the private email sample,
+model names, timings, results, successful/failed IDs, keep/drop disagreements,
+and macOS memory pressure and swap snapshots every ten seconds. Failures are
+excluded from disagreement counts, never treated as negative classifications.
+The command exits nonzero on failed evaluations or blocked preflight. Review all
+disagreements and several agreements against the stored bodies; this small sample
+is not an accuracy benchmark. Success also requires no sustained memory pressure,
+which must be assessed from the snapshots; completion alone does not certify fit.
+
+The default remains `qwen3.5:9b`, and `compare.py` remains a rule-versus-LLM tool.
+To explicitly opt into a normal scan with the candidate after reviewing the trial:
+
+```bash
+venv/bin/python scanner.py --model hf.co/unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS
+```
+
+Unlike the isolated comparison, that normal scanner invocation uses its usual
+scan caches.

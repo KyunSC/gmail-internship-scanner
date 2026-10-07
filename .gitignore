@@ -8,3 +8,4 @@ results.json
 .last_results.json
 .github_seen.json
 venv/
+cli/.model_trials/
