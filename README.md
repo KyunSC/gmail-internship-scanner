@@ -4,7 +4,7 @@ Scans your Gmail for internship/co-op opportunities and analyzes them **locally*
 
 ## Why I built this
 
-I'm looking internships, and my inbox turned into a wall of job-alert digests from LinkedIn, Glassdoor, Jobright, Wellfound, Indeed and others. Most of them were noise: full-time roles, US-only postings, Fall or Winter terms, non-software "student" jobs, and the same listing re-sent across a dozen emails. The few internships I actually wanted were often buried halfway down a digest whose subject line never said "intern", so skimming subjects wasn't enough and opening every email took too long.
+I'm looking for internships, and my inbox turned into a wall of job-alert digests from LinkedIn, Glassdoor, Jobright, Wellfound, Indeed and others. Most of them were noise: full-time roles, US-only postings, Fall or Winter terms, non-software "student" jobs, and the same listing re-sent across a dozen emails. The few internships I actually wanted were often buried halfway down a digest whose subject line never said "intern", so skimming subjects wasn't enough and opening every email took too long.
 
 I wanted something that would:
 
