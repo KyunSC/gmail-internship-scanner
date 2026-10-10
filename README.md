@@ -1,6 +1,17 @@
 # Internship Scanner (Local)
 
-Scans your Gmail for internship/co-op opportunities and analyzes them **locally** using Ollama. Your email content never leaves your machine for analysis (aside from the Gmail API fetch from Google, where it already lives).
+Scans your Gmail for internship/co-op opportunities and analyzes them **locally** using Ollama. Your email content never leaves your machine for analysis (aside from the Gmail API fetch from Google, where it already lives). It also checks the popular community internship repos on GitHub (SimplifyJobs, vanshb03, and two Canada-focused lists) for new postings.
+
+## Why I built this
+
+I'm looking internships, and my inbox turned into a wall of job-alert digests from LinkedIn, Glassdoor, Jobright, Wellfound, Indeed and others. Most of them were noise: full-time roles, US-only postings, Fall or Winter terms, non-software "student" jobs, and the same listing re-sent across a dozen emails. The few internships I actually wanted were often buried halfway down a digest whose subject line never said "intern", so skimming subjects wasn't enough and opening every email took too long.
+
+I wanted something that would:
+
+- **Read the whole email, not just the subject**, and pull out only Summer 2027 software internships located in Canada
+- **Clear out the noise** by marking the irrelevant digests as read, while never touching anything that might matter
+- **Keep my email private**: the classification runs on a local model through Ollama, so my inbox isn't sent to a third-party AI service
+- **Go through the popular internship GitHub repos too**: lists like [SimplifyJobs](https://github.com/SimplifyJobs/Summer2027-Internships), [vanshb03](https://github.com/vanshb03/Summer2027-Internships), [michelleokolie](https://github.com/michelleokolie/canada-tech-internships-summer-2027) and [negarprh](https://github.com/negarprh/Canadian-Tech-Internships-2027) often post new internships hours before any email digest arrives, but they're long and hard to keep track of. `github_watcher.py` applies the same filters to them and shows only the postings I haven't seen yet, with the apply link
 
 ## Architecture
 
