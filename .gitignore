@@ -9,3 +9,5 @@ results.json
 .github_seen.json
 venv/
 cli/.model_trials/
+CLAUDE.md
+AGENTS.md
