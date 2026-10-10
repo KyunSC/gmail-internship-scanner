@@ -19,19 +19,24 @@ Gmail (Google servers) --API--> Your machine --Ollama--> Results (local only)
 ```
 gmail-internship-scanner/
 ├── cli/                   # Local command-line scanner (Python) — this README
-│   ├── scanner.py         # Main scanner — Gmail fetch + Ollama LLM analysis
+│   ├── scanner.py         # Main scanner — Gmail fetch + Ollama LLM analysis + inbox cleanup
 │   ├── github_watcher.py  # New Summer 2027 postings from GitHub listing repos (SimplifyJobs, vanshb03, michelleokolie, negarprh)
-│   ├── compare.py         # Dev tool: runs both LLM and rule-based filter, diffs results
+│   ├── compare.py         # Dev tool: runs both LLM and rule-based filter on aggregator emails, diffs results
+│   ├── compare_prompts.py # Dev tool: A/B two prompt templates on the same email set
+│   ├── compare_models.py  # Dev tool: opt-in, read-only baseline-vs-candidate model trial
 │   ├── dump_sender.py     # Dev tool: prints extracted bodies for a sender, to learn a new digest format
+│   ├── test_*.py          # Offline regression tests (no Gmail, no Ollama)
+│   ├── fixtures/          # Sample digest bodies used by the tests
 │   ├── credentials.json   # Google OAuth client secret (not committed)
 │   ├── token.json         # Cached OAuth token (not committed)
 │   ├── .last_scan.json    # Accumulated scan snapshot — seen emails for incremental scans + --from-cache (not committed)
 │   ├── .github_seen.json  # github_watcher.py's seen postings + saved ETags (not committed)
+│   ├── .model_trials/     # compare_models.py output (not committed)
 │   └── requirements.txt
-└── web/                   # Browser dashboard (fully client-side; runs Gmail + LLM in the browser)
+└── web/                   # Browser dashboard (fully client-side; runs Gmail + LLM in the browser) — see web/README.md
 ```
 
-> **The commands in this README are run from the `cli/` directory** — `cd cli` first (or prefix paths with `cli/`). The browser app under `web/` is separate and shares nothing with the CLI at runtime.
+> **The commands in this README are run from the `cli/` directory** — `cd cli` first (or prefix paths with `cli/`). The browser app under `web/` is separate and shares nothing with the CLI at runtime; its setup lives in [web/README.md](web/README.md).
 
 ---
 
@@ -113,9 +118,10 @@ Scans unread emails from the last 30 days, classifies them with Ollama, and prin
 | `--debug` | Print raw LLM response for each batch | off |
 | `--clean-inbox` | After scanning, mark non-internship aggregator emails as read (dry run unless `--apply` is also passed) | off |
 | `--apply` | Actually apply the `--clean-inbox` changes | dry run |
-| `--from-cache` | Skip the LLM scan and run `--clean-inbox` against the previous run's cached results (`~1 sec` instead of ~5 min) | off |
+| `--from-cache` | Skip the LLM scan and run `--clean-inbox` against the previous run's cached results (`~1 sec` instead of ~5 min). Requires `--clean-inbox` | off |
 | `--fast` | Skip the LLM and use the full-body rule-based keyword filter only (~50× faster, no per-email summary) | off |
 | `--rescan` | Re-analyze emails already in the cache instead of skipping them | skip seen emails |
+| `--clear-cache` | Delete `.last_scan.json` and `.last_results.json`, then exit | — |
 
 ### Examples
 
@@ -178,13 +184,13 @@ To re-analyze everything the queries return — ignoring the cache — pass `--r
 python scanner.py --rescan
 ```
 
-> The cache stores only message IDs, subjects, senders, and dates — no bodies. Delete `.last_scan.json` to reset the seen-set and start fresh.
+> The cache stores only message IDs, subjects, senders, dates, and company/title keys for listing dedupe — no bodies. Run `python scanner.py --clear-cache` (or delete `.last_scan.json`) to reset the seen-set and start fresh. `compare.py` shares the same cache.
 
 ---
 
 ## Inbox cleanup (`--clean-inbox`)
 
-`--clean-inbox` acts only on successfully evaluated emails from the current scan. Messages omitted by fetch caps, keyword searches, fetch failures, or analysis failures are untouched. It finds unread emails from job aggregators (LinkedIn, Glassdoor, Jobright, Wellfound, ZipRecruiter, Indeed) that the scanner did **not** surface as internship-relevant and marks them as read, clearing inbox noise.
+`--clean-inbox` acts only on successfully evaluated emails from the current scan. Messages omitted by fetch caps, keyword searches, fetch failures, or analysis failures are untouched. It finds unread emails from job aggregators (LinkedIn job alerts, Glassdoor, Jobright, Wellfound, ZipRecruiter, Indeed, Intern Insider) that the scanner did **not** surface as internship-relevant and marks them as read, clearing inbox noise.
 
 - Without `--apply`: dry run — lists what would be marked, touches nothing
 - With `--apply`: actually marks them as read
@@ -227,16 +233,18 @@ Runs several targeted Gmail queries (internship/co-op/stage keywords, applicatio
 Before hitting the LLM, emails with no internship signal are dropped:
 - Subject, body, or sender must contain an internship keyword (`intern`, `internship`, `co-op`, `coop`, `student`, `stagiaire`, or `stage` in French context only — see note below)
 - Only qualifying listings that explicitly say Summer 2027 are kept; undated and other-term listings are excluded
+- Digest listings must be in a software/tech field (software, developer, data, ML/AI, research, embedded, etc.) — a bare "student" or "engineering intern" hit isn't enough
+- QA/testing-focused roles (QA Engineer, QA Analyst, Software Tester, …) are excluded; Automation Engineer roles are kept unless explicitly QA
 - Digest listings must be located in Canada — any province or major city, or remote roles based in Canada ("Canada (Remote)", "Remote in Canada"). A bare "remote" doesn't count, and US-only listings are dropped. Your own application confirmations, recruiter outreach, and interview invites are kept regardless of location
 
 **Note on `stage`:** The word "stage" in English matches startup funding rounds ("Late Stage", "Early Stage"). The scanner only treats `stage` as an internship signal in the body when French words appear directly before or after it (e.g. `"un stage"`, `"bénévole stage"`, `"stage développeur"`). Subject-line matching is unaffected.
 
 ### 3. LLM classify
-Pre-filtered emails are sorted by Gmail message ID (stable ordering — a newly arrived email no longer reshuffles existing positions) and sent to Ollama **one email per request, twice each** (`temperature=0` then `temperature=0.5`). The two passes are unioned by email index; results only one pass surfaced are kept. This buys recall on borderline cases — buried internships in aggregator digests, in particular — at the cost of more LLM calls. Sending one email at a time also keeps the body high in the model's attention, which matters for catching listings buried mid-digest.
+Pre-filtered emails are sorted by Gmail message ID (stable ordering — a newly arrived email no longer reshuffles existing positions) and sent to Ollama **one email per request, twice each** (`temperature=0` then `temperature=0.5`, set by `LLM_PASS_TEMPERATURES`; each request times out after 180 s). The two passes are unioned by email index; results only one pass surfaced are kept. This buys recall on borderline cases — buried internships in aggregator digests, in particular — at the cost of more LLM calls. Sending one email at a time also keeps the body high in the model's attention, which matters for catching listings buried mid-digest.
 
 The Ollama request passes `think: false` so Qwen3-family models route their content into the actual response instead of an empty `<think>` block. The flag is silently ignored by non-Qwen3 models.
 
-The prompt instructs the model to return only genuine internship/co-op/stage/student positions and to scan aggregator digest bodies (LinkedIn, Glassdoor, Jobright, Wellfound) for buried listings. Results include category, summary, action items, and priority.
+The prompt instructs the model to return only genuine software internship/co-op/stage/student positions (excluding QA/testing roles) and to scan aggregator digest bodies (LinkedIn, Glassdoor, Jobright, Wellfound, Intern Insider) for buried listings. Results include category, summary, action items, and priority.
 
 ### 4. Post-filter
 LLM results are validated:
@@ -247,7 +255,10 @@ LLM results are validated:
 - Duplicates from LLM hallucination are removed
 
 ### 5. Display
-Results are sorted by priority and color-coded by category: `INTERNSHIP` (green), `RECRUITER` (magenta), `APP CONFIRM` (blue), `REPLY` (yellow), `STATUS` (white).
+Results are sorted by priority and color-coded by category: `INTERNSHIP` (green), `RECRUITER` (magenta), `APP CONFIRM` (blue), `REPLY/FOLLOW-UP` (yellow), `STATUS UPDATE` (white).
+
+### Failure handling
+An email counts as evaluated only once **both** LLM passes complete for it. Failed classification passes are reported separately, recorded in the cache as failed, and retried on the next run. A successful rescan replaces an email's old keep/drop decision; a failed one preserves it. Cleanup never touches failed emails. The explicit `--from-cache` mode keeps its broader, potentially stale cleanup behaviour, but still excludes known failed analyses and never records cleanup as analysis.
 
 ---
 
@@ -283,14 +294,19 @@ Most negarprh postings don't say which term they're for, so by default they only
 
 ## Dev tools
 
+> **Don't run any of these alongside `python scanner.py`** (except `dump_sender.py`, which doesn't use Ollama). They all invoke Ollama, and concurrent processes contend for VRAM (each spawned generate request gets its own KV cache slot reserved server-side). Run them sequentially.
+
 ### `compare.py` — LLM vs rule-based comparison
 
-Fetches emails once, runs both the pure rule-based full-body parser and the full LLM scanner pipeline on the same set, then diffs the results.
+Fetches unread aggregator emails (the same sender set `--clean-inbox` acts on) once, runs both the pure rule-based full-body parser and the full LLM scanner pipeline on the same set, then diffs the results. It shares `.last_scan.json` with `scanner.py`, so emails already analyzed are skipped.
 
 ```bash
 python compare.py              # last 30 days, unread only
 python compare.py --days 60    # extend the window
 python compare.py --all        # include read emails
+python compare.py -n 200       # cap emails fetched (default 500)
+python compare.py --apply      # mark emails read when BOTH pipelines agree they're not internships (default is dry run)
+python compare.py --clear-cache
 ```
 
 Output sections:
@@ -299,60 +315,27 @@ Output sections:
 - **LLM-BASED** — emails the LLM scanner surfaced after full analysis
 - **DIFF SUMMARY** — which emails each approach caught that the other missed
 
-Use this to tune the prompt, adjust keyword rules, or verify that a code change doesn't cause regressions.
-
-> **Don't run this alongside `python scanner.py`.** Both invoke Ollama, and the two processes will contend for VRAM (each spawned generate request gets its own KV cache slot reserved server-side). Run them sequentially.
+Use this to tune the prompt, adjust keyword rules, or verify that a code change doesn't cause regressions. `--apply` only marks emails that both pipelines evaluated successfully and both agreed to drop.
 
 **Key finding from initial comparison:** The LLM correctly drops Glassdoor digest emails where `intern` appears only in the footer boilerplate (`"Create job alerts for related roles: software intern"`), while the rule-based filter cannot distinguish these from real listings. The LLM is the meaningful filter for aggregator digest noise.
 
----
+### `compare_prompts.py` — prompt A/B test
 
-## Recommended models
-
-| Model | RAM needed | Speed | Quality |
-|-------|-----------|-------|---------|
-| `qwen3.5:9b` | ~6 GB | Fast | Very good (recommended) |
-| `qwen2.5:14b` | ~10 GB | Medium | Very good |
-| `qwen2.5:7b` | ~5 GB | Fast | Good |
-| `llama3.1:8b` | ~6 GB | Fast | Good |
-| `mistral:7b` | ~5 GB | Fast | Good |
-| `gemma2:9b` | ~7 GB | Fast | Good |
-| `qwen3:30b-a3b` | ~18 GB | Slow on ≤24 GB Macs (paging) | Excellent — but needs `iogpu.wired_limit_mb` bump or 32 GB+ RAM to be usable |
-| `llama3.1:70b` | ~40 GB | Slow | Excellent |
-
-Smaller models (7b/8b) occasionally return malformed JSON or rename expected keys — the scanner tolerates this and skips bad batches, but a 14b+ model gives more consistent results per run.
-
----
-
-## Privacy
-
-- Email content is fetched from Gmail via Google's official API (HTTPS, OAuth2)
-- All analysis runs locally through Ollama — no data is sent to OpenAI, Anthropic, or any other AI provider
-- `credentials.json` and `token.json` stay on your machine and are already in `.gitignore`
-- `.last_scan.json` (the `--from-cache` snapshot) stores only message IDs, subjects, senders, and dates — no email bodies — and is also gitignored
-- `github_watcher.py` only makes anonymous GET requests to `raw.githubusercontent.com`; nothing about you or your inbox is sent. Its `.github_seen.json` is gitignored
-
-## Offline regression checks
-
-From `cli/`, using the project virtualenv:
+Fetches emails once and runs the LLM twice, with the default prompt (`PROMPT_DEFAULT`) and the shorter one (`PROMPT_TIGHT`), then prints a side-by-side diff. Use it to check that a prompt change doesn't regress classification before swapping it in.
 
 ```bash
-venv/bin/python -m unittest discover -v
-venv/bin/python test_linkedin.py
-venv/bin/python test_wellfound.py
-venv/bin/python test_interninsider.py
-venv/bin/python test_target_term.py
-venv/bin/python test_location.py
+python compare_prompts.py            # -d/--days, -n/--max-emails, --all as in scanner.py
 ```
 
-Failed classification passes are reported separately and remain eligible for retry.
-Both LLM passes must complete before a decision replaces an earlier result.
-Successful rescans replace old keep decisions; failures preserve them. `compare.py
---apply` requires successful evaluation and negative agreement from both pipelines.
-The explicit `--from-cache` mode retains its broader, potentially stale cleanup
-behavior, but excludes known failed analyses and never records cleanup as analysis.
+### `dump_sender.py` — inspect a sender's digest format
 
-### Opt-in model trial: Qwen3.8 27B IQ4_XS
+Prints the extracted bodies of every email from a sender substring, to reverse-engineer a new digest format (separators, header/footer chrome, body length) before teaching `scanner.py` about it. Uses a raw `from:` query so digests that never say "intern" still show up. Read-only: no Ollama, no writes.
+
+```bash
+python dump_sender.py wellfound --days 180 --all   # also: --max N (default 50), --chars N
+```
+
+### `compare_models.py` — opt-in model trial (Qwen3.8 27B IQ4_XS)
 
 From `cli/`, with Ollama running:
 
@@ -370,8 +353,7 @@ The exact model tag is required; a different quantization will not satisfy the
 availability check. The runner checks both models on a synthetic email before
 accessing Gmail, then fetches up to 20 unread aggregator emails **once**. It uses
 read-only Gmail operations (an existing broader OAuth token may be reused), never
-marks messages read, and never reads or writes normal scanner caches. Do not run
-other Ollama workloads alongside it.
+marks messages read, and never reads or writes normal scanner caches.
 
 Both models receive identical content sequentially, with keyword prefiltering
 disabled. Existing prompts, two-pass temperatures, context sizing, 180-second
@@ -388,8 +370,8 @@ disagreements and several agreements against the stored bodies; this small sampl
 is not an accuracy benchmark. Success also requires no sustained memory pressure,
 which must be assessed from the snapshots; completion alone does not certify fit.
 
-The default remains `qwen3.5:9b`, and `compare.py` remains a rule-versus-LLM tool.
-To explicitly opt into a normal scan with the candidate after reviewing the trial:
+The default remains `qwen3.5:9b`. To explicitly opt into a normal scan with the
+candidate after reviewing the trial:
 
 ```bash
 venv/bin/python scanner.py --model hf.co/unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS
@@ -397,3 +379,48 @@ venv/bin/python scanner.py --model hf.co/unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS
 
 Unlike the isolated comparison, that normal scanner invocation uses its usual
 scan caches.
+
+---
+
+## Offline regression checks
+
+No Gmail or Ollama needed. From `cli/`, using the project virtualenv:
+
+```bash
+venv/bin/python -m unittest discover -v   # test_scan_safety, test_github_watcher, test_compare_models, test_interninsider_cleanup
+venv/bin/python test_linkedin.py
+venv/bin/python test_wellfound.py
+venv/bin/python test_interninsider.py
+venv/bin/python test_target_term.py
+venv/bin/python test_location.py
+```
+
+The last five are standalone scripts (not `unittest` cases), so `discover` doesn't pick them up — run them directly.
+
+---
+
+## Recommended models
+
+| Model | RAM needed | Speed | Quality |
+|-------|-----------|-------|---------|
+| `qwen3.5:9b` | ~6 GB | Fast | Very good (recommended) |
+| `qwen2.5:14b` | ~10 GB | Medium | Very good |
+| `qwen2.5:7b` | ~5 GB | Fast | Good |
+| `llama3.1:8b` | ~6 GB | Fast | Good |
+| `mistral:7b` | ~5 GB | Fast | Good |
+| `gemma2:9b` | ~7 GB | Fast | Good |
+| `qwen3:30b-a3b` | ~18 GB | Slow on ≤24 GB Macs (paging) | Excellent — but needs `iogpu.wired_limit_mb` bump or 32 GB+ RAM to be usable |
+| `llama3.1:70b` | ~40 GB | Slow | Excellent |
+
+Smaller models (7b/8b) occasionally return malformed JSON or rename expected keys — the scanner tolerates this, records the email as failed, and retries it next run, but a 14b+ model gives more consistent results per run.
+
+---
+
+## Privacy
+
+- Email content is fetched from Gmail via Google's official API (HTTPS, OAuth2)
+- All analysis runs locally through Ollama — no data is sent to OpenAI, Anthropic, or any other AI provider
+- `credentials.json` and `token.json` stay on your machine and are already in `.gitignore`
+- `.last_scan.json` (the `--from-cache` snapshot) stores only message IDs, subjects, senders, dates, and company/title listing keys — no email bodies — and is also gitignored
+- `github_watcher.py` only makes anonymous GET requests to `raw.githubusercontent.com`; nothing about you or your inbox is sent. Its `.github_seen.json` is gitignored
+- `compare_models.py` writes the sampled email bodies into `.model_trials/`, which is gitignored — delete it when you're done reviewing a trial
