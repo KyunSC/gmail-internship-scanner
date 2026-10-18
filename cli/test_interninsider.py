@@ -68,8 +68,8 @@ TORONTO_STRATEGY = ("Student, Junior Strategy Analyst (AI Strategy) Sun Life "
                     "Toronto, Ontario, Canada Develop executive-ready "
                     "presentations and strategic recommendations for senior "
                     "leadership")
-# An explicit-term Montreal software fixture survives on its own term; the
-# termless qualifying cards above are excluded by the season gate.
+# Termless qualifying cards like these pass the season gate; only an explicit
+# Winter or Fall term excludes a card.
 # Out-of-country cards, shaped like the Canadian ones above: these must still
 # fail the location gate. SEATTLE_IT says "remote" in its blurb (adapted from a
 # real Calgary BURNCO card), which once counted as a remote location.
@@ -142,18 +142,17 @@ def main() -> int:
     check(failures, all("just now" not in c for c in chunks),
           f"posting age leaked into a chunk: {chunks}")
 
-    # 4. The alert name in the digest's own chrome cannot rescue termless
-    #    cards: each one fails the explicit-term check.
+    # 4. A digest with no qualifying card stays excluded, and termless cards
+    #    are not off-target: only an explicit Winter or Fall term is.
     body = digest(SEATTLE_SWE, AUSTIN_SWE)
     check(failures, _all_intern_listings_excluded(SENDER, body),
-          "off-target digest rescued by the alert name in its own chrome")
-    check(failures, all(_is_off_target_term(c) for c in chunks),
-          f"a card claimed the target term it never states: {chunks}")
+          "digest with no qualifying card was kept")
+    check(failures, not any(_is_off_target_term(c) for c in chunks),
+          f"a termless card was judged off-target: {chunks}")
 
     # 5. Out-of-country internships are dropped on location, which the
     #    non-aggregator path never checked at all. Canadian ones outside
-    #    Montreal surface, but the season gate excludes them: their cards state
-    #    no term, and the "Summer 2027" alert name does not supply one.
+    #    Montreal surface and pass the season gate: their cards state no term.
     for label, card in (("Seattle", SEATTLE_SWE), ("Austin", AUSTIN_SWE)):
         b = digest(card)
         check(failures, not _has_internship_signal("1 new match", b, SENDER),
@@ -162,8 +161,8 @@ def main() -> int:
         b = digest(card)
         check(failures, _has_internship_signal("1 new match", b, SENDER),
               f"{label} internship was dropped despite being in Canada")
-        check(failures, _all_intern_listings_excluded(SENDER, b),
-              f"termless {label} card inherited the alert name's term")
+        check(failures, not _all_intern_listings_excluded(SENDER, b),
+              f"termless {label} card was excluded")
 
     # 6. Toronto business-strategy roles are dropped — not on location any
     #    more, but because nothing in the card is software. The LLM arm once
@@ -172,17 +171,20 @@ def main() -> int:
     check(failures, not _has_internship_signal("1 new match", b, SENDER),
           "Toronto strategy-analyst role surfaced")
 
-    # 7. Explicit listing terms still work: Montreal, software, and Summer
-    #    2027 stated by the card itself.
+    # 7. An explicit Summer 2027 card and a termless one both qualify; the
+    #    non-software card does not.
     good = digest(MONTREAL_SWE, CALGARY_SWE, TORONTO_STRATEGY)
     check(failures, _has_internship_signal("3 new matches", good, SENDER),
           "digest containing a Montreal Summer 2027 internship was dropped")
     check(failures, not _all_intern_listings_excluded(SENDER, good),
           "on-target Montreal listing was rejected by the season gate")
+    check(failures, _all_intern_listings_excluded(SENDER, digest(HIVER, alert="Winter 2027")),
+          "Hiver 2027 card passed the season gate")
     qualifying = [c for c in _split_aggregator_listings(SENDER, good)
                   if _is_qualifying_listing(c) and not _is_off_target_term(c)]
-    check(failures, len(qualifying) == 1 and "Nimbus Labs" in qualifying[0],
-          f"expected exactly the Nimbus Labs listing to qualify, got {qualifying}")
+    check(failures, len(qualifying) == 2 and "Nimbus Labs" in qualifying[0]
+          and "Hexagon" in qualifying[1],
+          f"expected the Nimbus Labs and Hexagon listings to qualify, got {qualifying}")
 
     # 8. Weekly newsletters from the same domain degrade to one chunk instead of
     #    shattering on the "2 days ago" that appears in their prose.
@@ -190,15 +192,15 @@ def main() -> int:
           _split_aggregator_listings(SENDER, NEWSLETTER_BODY) == [NEWSLETTER_BODY],
           "marketing newsletter was split as if it were a card digest")
 
-    # Termless qualifying cards are surfaced but excluded, whatever the alert
-    # is named; per-listing gates stay mandatory.
+    # Termless qualifying cards are surfaced and kept, whatever the alert is
+    # named; per-listing gates stay mandatory.
     for card in (LYFT, PWC_SERVICE, PWC_PRIVACY, BREE_COOP):
         check(failures, _has_internship_signal("1 new match", digest(card), SENDER),
               f"qualifying card has no internship signal: {card}")
-        check(failures, _all_intern_listings_excluded(SENDER, digest(card)),
-              f"termless card inherited the alert name's term: {card}")
-    check(failures, _all_intern_listings_excluded(SENDER, digest(LYFT, alert="Montreal SWE")),
-          "non-target name rescued termless Lyft")
+        check(failures, not _all_intern_listings_excluded(SENDER, digest(card)),
+              f"termless card was excluded: {card}")
+    check(failures, not _all_intern_listings_excluded(SENDER, digest(LYFT, alert="Montreal SWE")),
+          "termless Lyft was excluded under a non-target alert name")
     check(failures, not _all_intern_listings_excluded(SENDER, digest(MONTREAL_SWE, alert="Montreal SWE")),
           "non-target name blocked explicit target")
     for card in (HIVER, SEATTLE_SWE, AUSTIN_SWE,
@@ -206,7 +208,7 @@ def main() -> int:
                  "Software QA Intern Nimbus Labs Montreal, Quebec, Canada Build backend services"):
         check(failures, _all_intern_listings_excluded(SENDER, digest(card)),
               f"card bypassed a listing gate: {card}")
-    check(failures, _is_off_target_term(LYFT), "termless card kept")
+    check(failures, not _is_off_target_term(LYFT), "termless card excluded")
     check(failures, not _is_off_target_term("Winter 2027 and Summer 2027 Software Intern"),
           "explicit target lost precedence")
 
@@ -256,9 +258,15 @@ def main() -> int:
         check(failures, bool(_OTHER_TERM_REGEX.search(text)), f"other-term regex missed {text!r}")
     for text in negatives:
         check(failures, not _OTHER_TERM_REGEX.search(text), f"other-term regex falsely matched {text!r}")
-    for text, excluded in ((HIVER, True), ("Summer 2026", True), ("SU26", True),
-                           ("W27", True), (LYFT, True), ("Intern Cyber Security 2027", True),
-                           ("Summer Intern", True), ("Summer 2027", False)):
+    for text, excluded in ((HIVER, True), ("W27", True), ("F2026", True),
+                           ("Fall Co-op", True), ("Winter internship", True),
+                           ("Stage d'automne", True), ("Fall '26", True),
+                           ("Summer 2026", False), ("SU26", False), ("Spring 2027", False),
+                           (LYFT, False), ("Intern Cyber Security 2027", False),
+                           ("Summer Intern", False), ("Summer 2027", False),
+                           ("Winter 2027 and Summer 2027 Software Intern", False),
+                           ("Responsibilities fall under the 2027 roadmap", False),
+                           ("Winter", False), ("Fall", False), ("wintergreen 2027", False)):
         check(failures, _is_off_target_term(text) == excluded,
               f"season decision incorrect for {text!r}")
 

@@ -31,7 +31,8 @@ Gmail (Google servers) --API--> Your machine --Ollama--> Results (local only)
 gmail-internship-scanner/
 ├── cli/                   # Local command-line scanner (Python) — this README
 │   ├── scanner.py         # Main scanner — Gmail fetch + Ollama LLM analysis + inbox cleanup
-│   ├── github_watcher.py  # New Summer 2027 postings from GitHub listing repos (SimplifyJobs, vanshb03, michelleokolie, negarprh)
+│   ├── plan_postings.py   # Read-only: per-posting check/skip plan + links for the /internships Chrome pass
+│   ├── github_watcher.py  # New postings (Winter/Fall excluded) from GitHub listing repos (SimplifyJobs, vanshb03, michelleokolie, negarprh)
 │   ├── compare.py         # Dev tool: runs both LLM and rule-based filter on aggregator emails, diffs results
 │   ├── compare_prompts.py # Dev tool: A/B two prompt templates on the same email set
 │   ├── compare_models.py  # Dev tool: opt-in, read-only baseline-vs-candidate model trial
@@ -42,6 +43,7 @@ gmail-internship-scanner/
 │   ├── token.json         # Cached OAuth token (not committed)
 │   ├── .last_scan.json    # Accumulated scan snapshot — seen emails for incremental scans + --from-cache (not committed)
 │   ├── .github_seen.json  # github_watcher.py's seen postings + saved ETags (not committed)
+│   ├── .postings_plan.json # plan_postings.py output (not committed)
 │   ├── .model_trials/     # compare_models.py output (not committed)
 │   └── requirements.txt
 └── web/                   # Browser dashboard (fully client-side; runs Gmail + LLM in the browser) — see web/README.md
@@ -243,7 +245,7 @@ Runs several targeted Gmail queries (internship/co-op/stage keywords, applicatio
 ### 2. Pre-filter (rule-based)
 Before hitting the LLM, emails with no internship signal are dropped:
 - Subject, body, or sender must contain an internship keyword (`intern`, `internship`, `co-op`, `coop`, `student`, `stagiaire`, or `stage` in French context only — see note below)
-- Only qualifying listings that explicitly say Summer 2027 are kept; undated and other-term listings are excluded
+- A listing is excluded on term only if it explicitly says Winter or Fall (e.g. "Winter 2027", "Fall Co-op", "Hiver 2027", "W27") and not Summer 2027. Undated and other-term listings are kept, and the `/internships` Chrome pass checks the term on the posting page
 - Digest listings must be in a software/tech field (software, developer, data, ML/AI, research, embedded, etc.) — a bare "student" or "engineering intern" hit isn't enough
 - QA/testing-focused roles (QA Engineer, QA Analyst, Software Tester, …) are excluded; Automation Engineer roles are kept unless explicitly QA
 - Digest listings must be located in Canada — any province or major city, or remote roles based in Canada ("Canada (Remote)", "Remote in Canada"). A bare "remote" doesn't count, and US-only listings are dropped. Your own application confirmations, recruiter outreach, and interview invites are kept regardless of location
@@ -262,7 +264,7 @@ LLM results are validated:
 - Fields are mapped back to the original email (prevents hallucination of sender/date)
 - Companies not found in the email body are nulled out
 - Aggregator emails without any internship signal are dropped
-- Listings without an explicit Summer 2027 term are excluded per-listing (a digest with one Summer 2027 co-op and one Fall co-op still passes)
+- Listings that explicitly say Winter or Fall are excluded per-listing (a digest with one Fall co-op and one undated co-op still passes)
 - Duplicates from LLM hallucination are removed
 
 ### 5. Display
@@ -284,14 +286,13 @@ Community repos list new internships within hours of opening — often before an
 | `michelle` | [michelleokolie/canada-tech-internships-summer-2027](https://github.com/michelleokolie/canada-tech-internships-summer-2027) | `listings.json` (Canada only) |
 | `negar` | [negarprh/Canadian-Tech-Internships-2027](https://github.com/negarprh/Canadian-Tech-Internships-2027) | README table (Canada only) |
 
-It applies the same rules as the scanner (Summer 2027, software, no QA roles, located in Canada), and prints only postings you haven't seen on a previous run, newest first, with the apply link. No Gmail, no Ollama.
+It applies the same rules as the scanner (not explicitly Winter/Fall, software, no QA roles, located in Canada), and prints only postings you haven't seen on a previous run, newest first, with the apply link. No Gmail, no Ollama.
 
 ```bash
 venv/bin/python github_watcher.py              # new postings since last run (marks them seen)
 venv/bin/python github_watcher.py --no-mark    # preview without marking anything seen
 venv/bin/python github_watcher.py --show-all   # every current match, seen or not
 venv/bin/python github_watcher.py --anywhere   # skip the Canada location filter
-venv/bin/python github_watcher.py --include-termless  # also postings that name no term, labelled [term not stated]
 venv/bin/python github_watcher.py --days 60    # widen the posting-age window (default 30)
 venv/bin/python github_watcher.py -o gh.json   # also export shown postings as JSON
 venv/bin/python github_watcher.py --reset      # forget seen postings
@@ -299,7 +300,25 @@ venv/bin/python github_watcher.py --reset      # forget seen postings
 
 The first run shows every current match. After that, a repo that hasn't changed answers with HTTP 304 via its saved ETag, so a quiet re-run downloads nothing. A role listed in several repos is shown once — matched by apply link, or by company + title allowing small spelling differences ("TRC" vs "TRC Companies"). Sources live in `SOURCES` at the top of the file; add another repo there if it publishes `listings.json` or a README table with Company / Role / Location / Apply / Date Posted columns.
 
-Most negarprh postings don't say which term they're for, so by default they only show when the title says Summer 2027. `--include-termless` shows them too, but many turn out to be Fall or Winter roles — check the posting before applying.
+Most negarprh postings don't say which term they're for. They're shown labelled `[term not stated]`, and many turn out to be Fall or Winter roles, so check the posting before applying (`/internships` does this in Chrome).
+
+---
+
+## Checking postings in Chrome (`/internships`)
+
+In Claude Code, started at the project root, `/internships` (optionally `--days N` / `--all`) goes through unread job-alert emails and new GitHub postings with the Claude in Chrome extension:
+
+1. `plan_postings.py` reads the unread digests **without changing Gmail**. It splits each one into postings, decides per posting whether to skip it (not an internship, not software, not in Canada, QA role, Winter/Fall term) or check it, and attaches the posting's own link. A posting repeated across digests is checked once.
+2. `github_watcher.py` lists new GitHub postings.
+3. Claude opens each posting to check in Chrome and judges it against the filter and `cli/profile.md`: ✅ Match, 🟡 Almost (one soft point off, e.g. no term stated), ❌ Mismatch, ❓ Unsure.
+4. `mark_read.py` marks an email read only if every posting in it was skipped or ❌. Anything else stays unread.
+5. It ends with a summary of the matches and almost-matches, and a **To apply** list.
+
+```bash
+cd cli
+venv/bin/python plan_postings.py            # preview the plan yourself (read-only)
+venv/bin/python plan_postings.py --days 60 --all
+```
 
 ---
 
@@ -398,7 +417,7 @@ scan caches.
 No Gmail or Ollama needed. From `cli/`, using the project virtualenv:
 
 ```bash
-venv/bin/python -m unittest discover -v   # test_scan_safety, test_github_watcher, test_compare_models, test_interninsider_cleanup
+venv/bin/python -m unittest discover -v   # test_scan_safety, test_github_watcher, test_plan_postings, test_compare_models, test_interninsider_cleanup
 venv/bin/python test_linkedin.py
 venv/bin/python test_wellfound.py
 venv/bin/python test_interninsider.py

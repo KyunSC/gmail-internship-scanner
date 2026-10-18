@@ -11,11 +11,11 @@ Always run from `cli/` with `venv/bin/python` (see AGENTS.md).
 
 - Never let a verification run write the user's `cli/.github_seen.json`.
   Use `--no-mark` against the real dir; `shasum .github_seen.json` before/after to prove it.
-- Live preview: `venv/bin/python github_watcher.py --no-mark --show-all [--include-termless] -o <scratch>/x.json`
+- Live preview: `venv/bin/python github_watcher.py --no-mark --show-all -o <scratch>/x.json`
   — `--show-all` bypasses ETags so every source is re-fetched; the JSON export carries `source`, `terms`, `category` for analysis.
 - Marking / ETag / state probes: copy `scanner.py` + `github_watcher.py` into a scratch dir
   and run them there with `cli/venv/bin/python` — `STATE_PATH` is next to the script, so state stays isolated.
-  Cycle worth driving: fresh run → rerun (expect 0 new, all `unchanged`) → `--include-termless` (filters changed → refetch).
+  Cycle worth driving: fresh run → rerun (expect 0 new, all `unchanged`) → `--anywhere` (filters changed → refetch).
 - Per-source counts (to see cross-repo dedupe): in the scratch copy,
   `python -c "import sys,github_watcher as g; g.SOURCES=[s for s in g.SOURCES if s['name']=='negar']; sys.argv=[...]; g.main()"`.
   Sum of per-source counts minus combined count = rows deduped.

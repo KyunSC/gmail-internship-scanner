@@ -56,7 +56,7 @@ SIMPLIFY_ROWS = [
                  category="Hardware"),                                                # keep
     simplify_row("Software Engineer Intern", "Usco", ["Remote in USA"]),              # --anywhere only
     simplify_row("Software Engineer Intern", "Oldterm", ["Toronto, ON, Canada"],
-                 terms=("Spring 2026",)),
+                 terms=("Spring 2026",)),                                             # keep: not Winter/Fall
     simplify_row("Software Engineer Intern", "Closed", ["Toronto, ON, Canada"], active=False),
     simplify_row("QA Automation Intern", "Testco", ["Toronto, ON, Canada"]),
     simplify_row("Analog Design Intern", "Chipco", ["Ottawa, ON, Canada"], category="Hardware"),
@@ -64,7 +64,7 @@ SIMPLIFY_ROWS = [
                  category="AI/ML/Data"),
     simplify_row("Software Engineer Intern", "Stale", ["Toronto, ON, Canada"], age=60 * 86400),
     simplify_row("Software Developer Intern", "Nadate", ["Toronto, ON, Canada"],
-                 terms=("N/A",)),                                                     # --include-termless only
+                 terms=("N/A",)),                                                     # keep: termless
 ]
 VANSH_ROWS = [
     vansh_row("Software Engineer Intern", "Gamma", ["Montreal, Canada"]),             # keep
@@ -85,8 +85,10 @@ NEGAR_README = f"""# Canadian Tech Internships
 
 Contributing text after the table.
 """
-EXPECTED = {"Acme", "Beta", "Delta", "Gamma", "Intelcom | Dragonfly"}
-TERMLESS = {"Nadate", "Intelcom | Dragonfly"}  # Intelcom's third row names no term
+# Only an explicit Winter/Fall term drops a posting: termless Nadate and
+# Spring-2026 Oldterm stay, Fallco goes.
+EXPECTED = {"Acme", "Beta", "Delta", "Gamma", "Intelcom | Dragonfly", "Nadate", "Oldterm"}
+EXPECTED_POSTINGS = len(EXPECTED) + 1  # Intelcom: the Summer 2027 row and the termless one
 
 
 def response(status, data=None, etag=None):
@@ -147,10 +149,9 @@ class NormalizeAndFilterTests(unittest.TestCase):
     def test_anywhere_drops_only_the_location_rule(self):
         self.assertEqual(self.wanted(anywhere=True), EXPECTED | {"Usco"})
 
-    def test_include_termless_adds_only_unstated_terms(self):
-        self.assertEqual(self.wanted(include_termless=True), EXPECTED | TERMLESS)
-        titles = {l["title"] for l in all_listings()
-                  if gw.is_wanted(l, 30, now=NOW, include_termless=True)}
+    def test_only_explicit_winter_or_fall_is_dropped(self):
+        self.assertNotIn("Fallco", self.wanted())
+        titles = {l["title"] for l in all_listings() if gw.is_wanted(l, 30, now=NOW)}
         self.assertIn("Back-end Developer Intern", titles)
         self.assertNotIn("Data Engineer Intern (Winter 2027)", titles)
 
@@ -204,7 +205,7 @@ class WatchStateTests(unittest.TestCase):
         fake = FakeGitHub()
         shown, statuses = self.run_watch(fake)
         self.assertEqual({l["company"] for l in shown}, EXPECTED)
-        self.assertEqual(len(shown), len(EXPECTED), "cross-repo duplicate shown twice")
+        self.assertEqual(len(shown), EXPECTED_POSTINGS, "cross-repo duplicate shown twice")
         self.assertEqual(set(statuses.values()), {"updated"})
 
         fake.sent.clear()
@@ -242,7 +243,7 @@ class WatchStateTests(unittest.TestCase):
 
     def test_no_mark_writes_nothing(self):
         shown, _ = self.run_watch(FakeGitHub(), mark=False)
-        self.assertEqual(len(shown), len(EXPECTED))
+        self.assertEqual(len(shown), EXPECTED_POSTINGS)
         self.assertFalse(self.state_path.exists())
 
     def test_failed_source_keeps_no_etag(self):
@@ -262,8 +263,7 @@ class WatchStateTests(unittest.TestCase):
 
     def test_changed_filters_refetch_instead_of_trusting_304(self):
         self.run_watch(FakeGitHub())
-        for kwargs, extra in (({"anywhere": True}, {"Usco"}),
-                              ({"include_termless": True}, TERMLESS)):
+        for kwargs, extra in (({"anywhere": True}, {"Usco"}),):
             fake = FakeGitHub()
             shown, _ = self.run_watch(fake, **kwargs)
             self.assertEqual({s for _, s in fake.sent}, {None}, kwargs)

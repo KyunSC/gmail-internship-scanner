@@ -108,37 +108,36 @@ INVITATION_BODY = (
     "Events Director @ McWiCS View profile View profile"
 )
 
-# Term strings under the single strict policy that now applies to every sender,
-# LinkedIn included: a listing is on-target only if it explicitly names Summer
-# 2027. Silence is off-target, and so is a bare year with no season word.
+# Term strings under the policy that applies to every sender, LinkedIn
+# included: a listing is off-target only if it explicitly names a Winter or Fall
+# term. Silence, a bare year and month-only dates pass; verify-postings checks
+# the term on the posting page.
 TERM_CASES = [
     # (chunk text, expected _is_off_target_term)
     ("Intern, AI Solutions (May - August 2027) PSP · Montreal, QC", False),
     ("Software Engineer Intern (Summer 2027) Acme · Montreal, QC", False),
     ("Stagiaire en développement logiciel - Été 2027 Flare · Montreal", False),
-    # Undated cards — the shape LinkedIn's exemption used to let through, and
-    # exactly the shape of the KPMG card that motivated dropping it.
-    ("QC - Stagiaire Développeur Frontend (Angular) KPMG Canada · Montreal, QC", True),
-    ("Software Engineer Intern LevelOps · Montreal, QC (Hybrid)", True),
-    ("Machine Learning Intern Epic Games · Greater Montreal Area", True),
-    # A bare year names no season, so it is not an explicit Summer 2027 term.
-    ("QC - Risk Services - Intern Cyber Security 2027 KPMG · Montreal", True),
-    # Listings naming a different term were already rejected, and still are.
+    # Undated cards pass.
+    ("QC - Stagiaire Développeur Frontend (Angular) KPMG Canada · Montreal, QC", False),
+    ("Software Engineer Intern LevelOps · Montreal, QC (Hybrid)", False),
+    ("Machine Learning Intern Epic Games · Greater Montreal Area", False),
+    # A bare year or month-only dates name no Winter/Fall term, so they pass.
+    ("QC - Risk Services - Intern Cyber Security 2027 KPMG · Montreal", False),
+    ("Consultant, Internship (Jan-April '27) KPMG Canada · Montreal", False),
+    ("Analyst Intern (September 2026) Foo Inc · Montreal, QC", False),
+    # An explicit Winter or Fall term is rejected.
     ("Machine Learning Intern/Co-op (Winter 2027) Cohere · Canada", True),
     ("Stagiaire DevOps - Automne 2026 Tecsys Inc. · Montreal, QC", True),
-    ("Consultant, Internship (Jan-April '27) KPMG Canada · Montreal", True),
     ("Intern - DevOps (Fall 2026) Tecsys Inc. · Montreal, QC", True),
     ("Engineering Student - Software - Fall 2026 MDA Space · QC", True),
-    ("Analyst Intern (September 2026) Foo Inc · Montreal, QC", True),
     ("Stagiaire, Génie industriel - Méthodes (Automne 2026) · Montreal", True),
 ]
 
 # The digest that ended LinkedIn's undated-card exemption (message
 # 1a00fcb66bb4519d, 17 Aug 2026). Two cards, neither of them a Summer 2027
 # software internship: McKesson's names Fall 2026 AND is a QA role, and KPMG's
-# names no term at all. The KPMG card qualified on intern + software + Montreal
-# and, being undated, used to count as on-target — so the email was surfaced
-# even though the user had checked and found no Summer 2027 role in it.
+# names no term at all. Undated cards now pass the term gate, so the KPMG card
+# keeps the digest and verify-postings checks its term in Chrome.
 KPMG_FRONTEND_SUBJECT = "QC - Stagiaire Développeur Frontend (Angular) at KPMG Canada"
 KPMG_FRONTEND_BODY = (
     "Jobs at KPMG Canada and more Your job alert for Engineer Intern "
@@ -288,23 +287,22 @@ def main() -> int:
                                      TRANSACTIONAL_BODY, LINKEDIN_SENDER),
           "profile nudge was surfaced as an internship")
 
-    # 10. Term policy: one strict rule for every sender. A listing is on-target
-    #     only if it explicitly names Summer 2027; silence is not evidence of a
-    #     summer start, and LinkedIn is no longer exempt from that.
+    # 10. Term policy: one rule for every sender. A listing is off-target only
+    #     if it explicitly names a Winter or Fall term.
     for text, expected in TERM_CASES:
         got = _is_off_target_term(text)
         check(failures, got is expected,
               f"term verdict {got} != {expected} for {text!r}")
 
-    # 11. The same rule reaches the other aggregators, which never had the
-    #     exemption: an undated Wellfound listing is dropped as it always was.
+    # 11. The same rule reaches the other aggregators: an undated Wellfound
+    #     listing is kept.
     wellfound_body = (
         "< Software Engineer Intern Nimbus Labs / 11-50 Employees | "
         "In office, Montreal | 0 years of exp | Internship Actively Hiring Learn More <"
     )
     check(failures,
-          _all_intern_listings_excluded(WELLFOUND_SENDER, wellfound_body),
-          "undated Wellfound listing survived the term gate")
+          not _all_intern_listings_excluded(WELLFOUND_SENDER, wellfound_body),
+          "undated Wellfound listing was dropped by the term gate")
 
     # 12. Bare "engineering" no longer reads as software, in either direction.
     for text, expected in SOFTWARE_KEYWORD_CASES:
@@ -333,9 +331,9 @@ def main() -> int:
         check(failures, not _is_linkedin_noise_sender(addr),
               f"job sender {addr!r} was wrongly classed as noise")
 
-    # 14. The KPMG frontend digest, end to end. Both cards must be rejected for
-    #     their own reason: the McKesson row for being a Fall 2026 QA role, the
-    #     KPMG row for naming no term at all.
+    # 14. The KPMG frontend digest, end to end. The McKesson row is rejected
+    #     for being a Fall 2026 QA role; the KPMG row names no term, so it
+    #     passes and keeps the digest.
     kpmg = split(KPMG_FRONTEND_BODY, KPMG_FRONTEND_SUBJECT)
     listings = [c for c in kpmg if " · " in c]
     check(failures, len(listings) == 2,
@@ -345,19 +343,15 @@ def main() -> int:
     check(failures, len(frontend) == 1 and _is_qualifying_listing(frontend[0]),
           f"KPMG frontend card stopped qualifying — check 14 is now vacuous: "
           f"{frontend}")
-    check(failures, frontend and _is_off_target_term(frontend[0]),
-          f"undated KPMG frontend card was judged on-target: {frontend}")
+    check(failures, frontend and not _is_off_target_term(frontend[0]),
+          f"undated KPMG frontend card was judged off-target: {frontend}")
     check(failures,
-          _all_intern_listings_excluded(LINKEDIN_SENDER, KPMG_FRONTEND_BODY,
-                                        KPMG_FRONTEND_SUBJECT),
-          "KPMG frontend digest survived the term gate")
-    check(failures,
-          not (_has_internship_signal(KPMG_FRONTEND_SUBJECT, KPMG_FRONTEND_BODY,
-                                      LINKEDIN_SENDER)
-               and not _all_intern_listings_excluded(LINKEDIN_SENDER,
-                                                     KPMG_FRONTEND_BODY,
-                                                     KPMG_FRONTEND_SUBJECT)),
-          "KPMG frontend digest would still reach the LLM as an internship")
+          _has_internship_signal(KPMG_FRONTEND_SUBJECT, KPMG_FRONTEND_BODY,
+                                 LINKEDIN_SENDER)
+          and not _all_intern_listings_excluded(LINKEDIN_SENDER,
+                                                KPMG_FRONTEND_BODY,
+                                                KPMG_FRONTEND_SUBJECT),
+          "KPMG frontend digest did not reach the LLM as an internship")
 
     if failures:
         print(f"FAILED {len(failures)} check(s):")

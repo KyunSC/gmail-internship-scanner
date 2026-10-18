@@ -1,6 +1,8 @@
 """
-Watch community GitHub internship repos and print Summer 2027 postings you
-haven't seen yet, newest first, with the apply link.
+Watch community GitHub internship repos and print postings you haven't seen
+yet, newest first, with the apply link. Only postings that explicitly name a
+Winter or Fall term are dropped; termless ones are labelled [term not stated]
+and checked on the posting page by the verify-postings skill.
 
 Most repos publish their listings as structured JSON
 (.github/scripts/listings.json); the rest are read from their README table.
@@ -11,7 +13,6 @@ downloads nothing.
     venv/bin/python github_watcher.py                    # new matches since last run
     venv/bin/python github_watcher.py --no-mark          # preview, remember nothing
     venv/bin/python github_watcher.py --show-all         # every current match
-    venv/bin/python github_watcher.py --include-termless # also postings that name no term
 """
 
 import argparse
@@ -29,6 +30,7 @@ from scanner import (
     BOLD, DIM, RESET,
     SEEN_CACHE_MAX,
     TARGET_TERM_REGEX,
+    _EXCLUDED_SEASON_REGEX,
     _OTHER_TERM_REGEX,
     _body_mentions_software,
     _mentions_excluded_role,
@@ -233,14 +235,14 @@ def _is_software(listing: dict) -> bool:
 
 
 def is_wanted(listing: dict, days: int, anywhere: bool = False,
-              now: float | None = None, include_termless: bool = False) -> bool:
-    """Open, Summer 2027 (or no stated term, with `include_termless`),
-    software, not QA, in Canada (unless `anywhere`), and posted within `days`.
-    An explicit Summer 2027 wins over other terms listed alongside it."""
+              now: float | None = None) -> bool:
+    """Open, not explicitly Winter/Fall, software, not QA, in Canada (unless
+    `anywhere`), and posted within `days`. An explicit Summer 2027 wins over
+    other terms listed alongside it."""
     now = time.time() if now is None else now
     terms = " / ".join(listing["terms"])
-    on_target = bool(TARGET_TERM_REGEX.search(terms)) or (
-        include_termless and not term_stated(listing))
+    on_target = (bool(TARGET_TERM_REGEX.search(terms))
+                 or not _EXCLUDED_SEASON_REGEX.search(terms))
     return (listing["active"] and listing["is_visible"]
             and on_target
             and _is_software(listing)
@@ -306,8 +308,7 @@ def save_state(state: dict) -> None:
 # ── Watch ───────────────────────────────────────────────────────────────────
 
 def watch(days: int = 30, anywhere: bool = False, show_all: bool = False,
-          mark: bool = True, include_termless: bool = False
-          ) -> tuple[list[dict], dict[str, str]]:
+          mark: bool = True) -> tuple[list[dict], dict[str, str]]:
     """Fetch every source and return (listings to show, status per source).
 
     An ETag is reused only under the same filters it was saved with: after a
@@ -315,7 +316,7 @@ def watch(days: int = 30, anywhere: bool = False, show_all: bool = False,
     silently hide listings the old filters dropped."""
     state = load_state()
     now = time.time()
-    filters = {"days": days, "anywhere": anywhere, "include_termless": include_termless}
+    filters = {"days": days, "anywhere": anywhere}
     matches: list[tuple[list[str], dict]] = []
     matched_keys: set[str] = set()
     statuses: dict[str, str] = {}
@@ -337,7 +338,7 @@ def watch(days: int = 30, anywhere: bool = False, show_all: bool = False,
             if not isinstance(raw, dict):
                 continue
             listing = normalize_listing(raw, src)
-            if not is_wanted(listing, days, anywhere, now, include_termless):
+            if not is_wanted(listing, days, anywhere, now):
                 continue
             keys = listing_keys(listing)
             if matched_keys.isdisjoint(keys):
@@ -375,7 +376,7 @@ def display(listings: list[dict], statuses: dict[str, str], show_all: bool) -> N
     now = time.time()
     label = "matching" if show_all else "new"
     print(f"\n{'='*70}")
-    print(f"  {len(listings)} {label} Summer 2027 posting(s) on GitHub")
+    print(f"  {len(listings)} {label} posting(s) on GitHub (Winter/Fall excluded)")
     print(f"{'='*70}\n")
     for l in listings:
         termless = "" if term_stated(l) else f" {YELLOW}[term not stated]{RESET}"
@@ -391,13 +392,11 @@ def display(listings: list[dict], statuses: dict[str, str], show_all: bool) -> N
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Show new Summer 2027 internships from GitHub listing repos")
+        description="Show new internships (not Winter/Fall) from GitHub listing repos")
     parser.add_argument("-d", "--days", type=int, default=30,
                         help="Only postings from the last N days (default: 30)")
     parser.add_argument("--anywhere", action="store_true",
                         help="Skip the Canada location filter")
-    parser.add_argument("--include-termless", action="store_true",
-                        help="Also show postings that name no term (may be Fall/Winter roles)")
     parser.add_argument("--show-all", action="store_true",
                         help="Show every current match, not just new ones")
     parser.add_argument("--no-mark", action="store_true",
@@ -413,7 +412,7 @@ def main() -> None:
         return
 
     listings, statuses = watch(args.days, args.anywhere, args.show_all,
-                               not args.no_mark, args.include_termless)
+                               not args.no_mark)
     display(listings, statuses, args.show_all)
     if args.output:
         export_json(listings, args.output)

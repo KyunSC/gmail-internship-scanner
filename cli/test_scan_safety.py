@@ -142,7 +142,7 @@ class ScanSafetyTests(unittest.TestCase):
         keys = scanner.qualifying_listing_keys(e['from'], e['body'], e['subject'])
         self.assertEqual(keys, ['glassdoor.com|tower research capital|stagiaire en developpement '
                                 'de logiciels ete 2027 software developer intern summer 2027'])
-        e2 = glassdoor('b', 'Software Developer QA I (Co-op) Montreal $44K - $185K ( Employer Est. ) '
+        e2 = glassdoor('b', 'Software Developer QA I (Fall 2026 Co-op) Montreal $44K - $185K ( Employer Est. ) '
                             'Just posted Tower Research Capital 4.1', f'{TOWER_TITLE} Montreal 5d CAE 3.9')
         self.assertEqual(scanner.qualifying_listing_keys(e2['from'], e2['body'], e2['subject']), keys)
 
