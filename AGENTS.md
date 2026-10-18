@@ -65,6 +65,14 @@ Use `--no-mark` when trying `github_watcher.py` yourself: a plain run records
 every shown posting in `cli/.github_seen.json`, so the user would never see
 those postings as new.
 
+### Verifying postings in Chrome (`verify-postings` skill)
+
+`cli/.claude/skills/verify-postings/SKILL.md` runs `compare.py --apply` and
+`github_watcher.py -o .github_new.json`, then opens each surviving posting in
+the user's Chrome (claude-in-chrome MCP) and checks it against the filter and
+`cli/profile.md` (gitignored; the user fills it in). Report only — mismatches
+change nothing in Gmail or `.github_seen.json`.
+
 ### Runtime prerequisites (only if a command actually reaches those stages)
 
 - **Ollama** must be running for the LLM pipeline: `ollama serve`, with a model
